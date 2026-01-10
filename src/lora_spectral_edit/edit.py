@@ -3,7 +3,7 @@ Spectral editing strategies for LoRA singular values.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 
@@ -11,7 +11,7 @@ import torch
 @dataclass
 class EditConfig:
     """Configuration for spectral editing."""
-    # Sensitivity mode: "abs_select" (recommended), "random_index", or "gd"
+    # Sensitivity mode: "abs_select" (recommended), "smooth_abs", "random_index", or "gd"
     mode: str = "abs_select"
 
     # abs_select mode parameters
@@ -21,6 +21,11 @@ class EditConfig:
     sup_factor: float = 0.80    # Multiplicative factor for noise dims
     mid_factor: float = 1.0     # Multiplicative factor for middle dims
     min_core_k: int = 1         # Minimum number of core dims
+
+    # smooth_abs mode parameters
+    smooth_temperature: float = 0.35   # larger -> smoother/flatter; smaller -> sharper
+    smooth_center_q: float = 0.5       # center quantile (0.5 = median)
+    smooth_align_mid: bool = True      # enforce gate(center)=mid_factor if feasible
 
     # gd mode parameters
     eta: float = 0.2            # Learning rate for gradient update
@@ -51,7 +56,7 @@ def apply_abs_select(
     sigma0: torch.Tensor,
     g_abs: torch.Tensor,
     config: EditConfig,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, int, int]:
     """
     Apply sensitivity-based feature selection.
 
@@ -70,20 +75,109 @@ def apply_abs_select(
 
     order = torch.argsort(g_abs, descending=True)
     core_idx = order[:k_core]
-    noise_idx = order[-k_noise:] if k_noise > 0 else torch.tensor([], dtype=torch.long)
+    noise_idx = (
+        order[-k_noise:]
+        if k_noise > 0
+        else torch.empty(0, dtype=torch.long, device=sigma0.device)
+    )
 
-    gate = torch.full_like(sigma0, config.mid_factor)
-    gate[core_idx] = config.amp_factor
+    gate = torch.full_like(sigma0, float(config.mid_factor))
+    gate[core_idx] = float(config.amp_factor)
     if k_noise > 0:
-        gate[noise_idx] = config.sup_factor
+        gate[noise_idx] = float(config.sup_factor)
 
     return sigma0 * gate, k_core, k_noise
+
+
+def apply_smooth_abs(
+    sigma0: torch.Tensor,
+    g_abs: torch.Tensor,
+    config: EditConfig,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Smooth, continuous scaling based on |g| using a sigmoid gate.
+
+    Inputs:
+        x_i = normalize(|g_i|)  (caller should pass normalized g_abs)
+
+    Mapping:
+        gate_i = sup + (amp - sup) * sigmoid((x_i - mu) / tau)
+
+    Where:
+        center = quantile(x, smooth_center_q)  (default median)
+        scale = quantile(x, 1 - core_frac) - quantile(x, noise_frac)
+        tau = smooth_temperature * scale
+
+    Optional:
+        Adjust mu so that gate(center) == mid_factor (if sup < mid < amp).
+    """
+    x = g_abs.to(dtype=torch.float32)
+    r = int(x.numel())
+
+    if (x.max() - x.min()).abs().item() < 1e-12:
+        gate = torch.full_like(sigma0, float(config.mid_factor))
+        return sigma0 * gate, {
+            "r": r,
+            "mode": "smooth_abs",
+            "degenerate": True,
+            "gate_min": float(gate.min().item()),
+            "gate_max": float(gate.max().item()),
+        }
+
+    q_lo = float(max(0.0, min(1.0, config.noise_frac)))
+    q_hi = float(max(0.0, min(1.0, 1.0 - config.core_frac)))
+    if q_hi <= q_lo:
+        q_lo, q_hi = 0.25, 0.75
+
+    lo = torch.quantile(x, q_lo)
+    hi = torch.quantile(x, q_hi)
+    scale = (hi - lo).clamp_min(1e-8)
+
+    center_q = float(max(0.0, min(1.0, config.smooth_center_q)))
+    center = torch.quantile(x, center_q)
+
+    tau = (float(config.smooth_temperature) * scale).clamp_min(1e-8)
+    mu = center
+
+    if config.smooth_align_mid:
+        sup = float(config.sup_factor)
+        amp = float(config.amp_factor)
+        mid = float(config.mid_factor)
+        if amp > sup and (sup < mid < amp):
+            p = (mid - sup) / (amp - sup)
+            p = float(max(1e-4, min(1.0 - 1e-4, p)))
+            p_t = torch.tensor(p, device=x.device, dtype=torch.float32)
+            logit = torch.log(p_t) - torch.log(1.0 - p_t)
+            mu = center - tau * logit
+
+    sup_t = torch.tensor(float(config.sup_factor), device=x.device, dtype=torch.float32)
+    amp_t = torch.tensor(float(config.amp_factor), device=x.device, dtype=torch.float32)
+    gate = sup_t + (amp_t - sup_t) * torch.sigmoid((x - mu) / tau)
+    gate = gate.to(dtype=sigma0.dtype)
+
+    sigma_new = sigma0 * gate
+    stats: Dict[str, Any] = {
+        "r": r,
+        "mode": "smooth_abs",
+        "q_lo": q_lo,
+        "q_hi": q_hi,
+        "center_q": center_q,
+        "lo": float(lo.item()),
+        "hi": float(hi.item()),
+        "center": float(center.item()),
+        "mu": float(mu.item()),
+        "tau": float(tau.item()),
+        "gate_min": float(gate.min().item()),
+        "gate_max": float(gate.max().item()),
+        "degenerate": False,
+    }
+    return sigma_new, stats
 
 
 def apply_random_index(
     sigma0: torch.Tensor,
     config: EditConfig,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, int, int]:
     """
     Apply random index selection with the same counts as abs_select.
 
@@ -99,12 +193,16 @@ def apply_random_index(
 
     order = torch.randperm(r, device=sigma0.device)
     core_idx = order[:k_core]
-    noise_idx = order[k_core:k_core + k_noise] if k_noise > 0 else torch.tensor([], dtype=torch.long)
+    noise_idx = (
+        order[k_core:k_core + k_noise]
+        if k_noise > 0
+        else torch.empty(0, dtype=torch.long, device=sigma0.device)
+    )
 
-    gate = torch.full_like(sigma0, config.mid_factor)
-    gate[core_idx] = config.amp_factor
+    gate = torch.full_like(sigma0, float(config.mid_factor))
+    gate[core_idx] = float(config.amp_factor)
     if k_noise > 0:
-        gate[noise_idx] = config.sup_factor
+        gate[noise_idx] = float(config.sup_factor)
 
     return sigma0 * gate, k_core, k_noise
 
@@ -156,7 +254,7 @@ def apply_spectral_edit(
     sigma0: torch.Tensor,
     g_sigma: torch.Tensor,
     config: Optional[EditConfig] = None,
-) -> tuple:
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
     Apply spectral edit to singular values based on gradient sensitivity.
 
@@ -178,33 +276,43 @@ def apply_spectral_edit(
     g_abs_norm = normalize_gradient(g_abs, config.grad_norm)
     g_norm = normalize_gradient(g, config.grad_norm)
 
-    stats = {
+    stats: Dict[str, Any] = {
         "r": int(sigma0.numel()),
+        "mode": config.mode,
         "g_abs_mean": float(g_abs.mean().item()),
         "g_abs_max": float(g_abs.max().item()),
     }
 
     if config.mode == "abs_select":
         sigma_new, k_core, k_noise = apply_abs_select(sigma0, g_abs_norm, config)
-        stats["k_core"] = k_core
-        stats["k_noise"] = k_noise
-        stats["amp_factor"] = config.amp_factor
-        stats["sup_factor"] = config.sup_factor
-        stats["mid_factor"] = config.mid_factor
+        stats.update({
+            "k_core": int(k_core),
+            "k_noise": int(k_noise),
+            "amp_factor": float(config.amp_factor),
+            "sup_factor": float(config.sup_factor),
+            "mid_factor": float(config.mid_factor),
+        })
+    elif config.mode == "smooth_abs":
+        sigma_new, smooth_stats = apply_smooth_abs(sigma0, g_abs_norm, config)
+        stats.update(smooth_stats)
+        stats["k_core"] = None
+        stats["k_noise"] = None
     elif config.mode == "random_index":
         sigma_new, k_core, k_noise = apply_random_index(sigma0, config)
-        stats["k_core"] = k_core
-        stats["k_noise"] = k_noise
-        stats["amp_factor"] = config.amp_factor
-        stats["sup_factor"] = config.sup_factor
-        stats["mid_factor"] = config.mid_factor
+        stats.update({
+            "k_core": int(k_core),
+            "k_noise": int(k_noise),
+            "amp_factor": float(config.amp_factor),
+            "sup_factor": float(config.sup_factor),
+            "mid_factor": float(config.mid_factor),
+        })
     else:
         sigma_new = apply_gd_update(sigma0, g_norm, config)
         stats["k_core"] = None
         stats["k_noise"] = None
 
     # Clip minimum
-    sigma_new = sigma_new.clamp_min(config.sigma_clip_min)
+    sigma_new = sigma_new.clamp_min(float(config.sigma_clip_min))
 
     # Preserve energy
     sigma_new = preserve_spectral_energy(sigma0, sigma_new, config.preserve_energy)
