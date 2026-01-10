@@ -387,8 +387,9 @@ def main():
     edit_parser.add_argument("--calib_batch_size", type=int, default=2,
                              help="Calibration batch size")
 
-    edit_parser.add_argument("--mode", type=str, choices=["abs_select", "gd"], default="abs_select",
-                             help="Edit mode: abs_select (sensitivity-based) or gd (gradient descent)")
+    edit_parser.add_argument("--mode", type=str, choices=["abs_select", "random_index", "gd"],
+                             default="abs_select",
+                             help="Edit mode: abs_select (sensitivity-based), random_index (uniform), or gd")
     edit_parser.add_argument("--core_frac", type=float, default=0.2,
                              help="Fraction of dims to amplify (abs_select mode)")
     edit_parser.add_argument("--noise_frac", type=float, default=0.2,

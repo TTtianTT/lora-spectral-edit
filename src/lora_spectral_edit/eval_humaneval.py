@@ -132,6 +132,7 @@ def run_humaneval_evaluate_functional_correctness(
     k: List[int] = [1],
     n_workers: int = 4,
     timeout: float = 3.0,
+    ignore_incomplete: bool = False,
 ) -> Tuple[dict, Optional[str]]:
     """
     Run HumanEval evaluation. Prefer Python API; fallback to CLI.
@@ -147,6 +148,8 @@ def run_humaneval_evaluate_functional_correctness(
             kwargs["n_workers"] = int(n_workers)
         if "timeout" in sig.parameters:
             kwargs["timeout"] = float(timeout)
+        if "ignore_incomplete" in sig.parameters:
+            kwargs["ignore_incomplete"] = bool(ignore_incomplete)
 
         res = evaluate_functional_correctness(samples_path, **kwargs)
         results_path = samples_path + "_results.jsonl"
@@ -228,6 +231,7 @@ def eval_one_adapter(
     out_dir: str,
     eval_n_workers: int = 4,
     eval_timeout: float = 3.0,
+    ignore_incomplete: bool = False,
 ) -> Dict[str, Any]:
     """
     Evaluate one adapter on HumanEval and return metrics.
@@ -263,6 +267,7 @@ def eval_one_adapter(
         k=[1],
         n_workers=eval_n_workers,
         timeout=eval_timeout,
+        ignore_incomplete=ignore_incomplete,
     )
 
     # Compute metrics
@@ -426,6 +431,8 @@ def main():
     }
 
     # Evaluate base model only
+    ignore_incomplete = args.max_samples is not None and int(args.max_samples) > 0
+
     if args.base_only:
         print("[Eval] Base model (no adapter) ...")
         base_metrics = eval_one_adapter(
@@ -438,6 +445,7 @@ def main():
             out_dir=out_dir,
             eval_n_workers=args.eval_n_workers,
             eval_timeout=args.eval_timeout,
+            ignore_incomplete=ignore_incomplete,
         )
         print(f"[vLLM][Base] {base_metrics}")
         results["base"] = base_metrics
@@ -456,6 +464,7 @@ def main():
                 out_dir=out_dir,
                 eval_n_workers=args.eval_n_workers,
                 eval_timeout=args.eval_timeout,
+                ignore_incomplete=ignore_incomplete,
             )
             print(f"[vLLM][Baseline] {baseline_metrics}")
             results["baseline"] = baseline_metrics
@@ -472,6 +481,7 @@ def main():
             out_dir=out_dir,
             eval_n_workers=args.eval_n_workers,
             eval_timeout=args.eval_timeout,
+            ignore_incomplete=ignore_incomplete,
         )
         print(f"[vLLM][Edited] {edited_metrics}")
         results["edited"] = edited_metrics

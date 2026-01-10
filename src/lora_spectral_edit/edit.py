@@ -11,7 +11,7 @@ import torch
 @dataclass
 class EditConfig:
     """Configuration for spectral editing."""
-    # Sensitivity mode: "abs_select" (recommended) or "gd"
+    # Sensitivity mode: "abs_select" (recommended), "random_index", or "gd"
     mode: str = "abs_select"
 
     # abs_select mode parameters
@@ -71,6 +71,35 @@ def apply_abs_select(
     order = torch.argsort(g_abs, descending=True)
     core_idx = order[:k_core]
     noise_idx = order[-k_noise:] if k_noise > 0 else torch.tensor([], dtype=torch.long)
+
+    gate = torch.full_like(sigma0, config.mid_factor)
+    gate[core_idx] = config.amp_factor
+    if k_noise > 0:
+        gate[noise_idx] = config.sup_factor
+
+    return sigma0 * gate, k_core, k_noise
+
+
+def apply_random_index(
+    sigma0: torch.Tensor,
+    config: EditConfig,
+) -> torch.Tensor:
+    """
+    Apply random index selection with the same counts as abs_select.
+
+    Randomly chooses core/noise indices uniformly, then applies amp/sup factors.
+    """
+    r = int(sigma0.numel())
+
+    k_core = max(int(round(r * config.core_frac)), config.min_core_k)
+    k_core = min(k_core, r)
+
+    k_noise = int(round(r * config.noise_frac))
+    k_noise = max(0, min(k_noise, r - k_core))
+
+    order = torch.randperm(r, device=sigma0.device)
+    core_idx = order[:k_core]
+    noise_idx = order[k_core:k_core + k_noise] if k_noise > 0 else torch.tensor([], dtype=torch.long)
 
     gate = torch.full_like(sigma0, config.mid_factor)
     gate[core_idx] = config.amp_factor
@@ -157,6 +186,13 @@ def apply_spectral_edit(
 
     if config.mode == "abs_select":
         sigma_new, k_core, k_noise = apply_abs_select(sigma0, g_abs_norm, config)
+        stats["k_core"] = k_core
+        stats["k_noise"] = k_noise
+        stats["amp_factor"] = config.amp_factor
+        stats["sup_factor"] = config.sup_factor
+        stats["mid_factor"] = config.mid_factor
+    elif config.mode == "random_index":
+        sigma_new, k_core, k_noise = apply_random_index(sigma0, config)
         stats["k_core"] = k_core
         stats["k_noise"] = k_noise
         stats["amp_factor"] = config.amp_factor
