@@ -4,6 +4,7 @@ GSM8K evaluation utilities using vLLM.
 This module is optional and requires vLLM to be installed.
 """
 
+import os
 import re
 from typing import Optional, List
 
@@ -18,6 +19,13 @@ try:
     HAVE_VLLM = True
 except ImportError:
     HAVE_VLLM = False
+
+
+def _env_truthy(name: str) -> bool | None:
+    val = os.environ.get(name)
+    if val is None:
+        return None
+    return val.strip().lower() in {"1", "true", "yes", "y"}
 
 
 def check_vllm_available():
@@ -104,14 +112,23 @@ def evaluate_gsm8k_vllm(
     if r <= 0:
         raise ValueError("Cannot determine LoRA rank r from adapter_config.json")
 
-    llm = LLM(
-        model=base_model_id,
-        dtype="float16",
-        max_model_len=max_model_len,
-        enable_lora=True,
-        max_lora_rank=r,
-        seed=seed,
-    )
+    gpu_mem_util = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", None)
+    gpu_mem_util = float(gpu_mem_util) if gpu_mem_util is not None else None
+
+    enforce_eager = _env_truthy("VLLM_ENFORCE_EAGER")
+    llm_kwargs = {
+        "model": base_model_id,
+        "dtype": "float16",
+        "max_model_len": max_model_len,
+        "enable_lora": True,
+        "max_lora_rank": r,
+        "seed": seed,
+    }
+    if gpu_mem_util is not None:
+        llm_kwargs["gpu_memory_utilization"] = gpu_mem_util
+    if enforce_eager is not None:
+        llm_kwargs["enforce_eager"] = enforce_eager
+    llm = LLM(**llm_kwargs)
     sp = SamplingParams(temperature=temperature, top_p=1.0, max_tokens=max_tokens)
 
     if max_samples is None or int(max_samples) < 0:
@@ -182,14 +199,23 @@ def evaluate_both_loras(
     if max_r <= 0:
         raise ValueError("Cannot determine LoRA rank from adapter configs")
 
-    llm = LLM(
-        model=base_model_id,
-        dtype="float16",
-        max_model_len=max_model_len,
-        enable_lora=True,
-        max_lora_rank=max_r,
-        seed=seed,
-    )
+    gpu_mem_util = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", None)
+    gpu_mem_util = float(gpu_mem_util) if gpu_mem_util is not None else None
+
+    enforce_eager = _env_truthy("VLLM_ENFORCE_EAGER")
+    llm_kwargs = {
+        "model": base_model_id,
+        "dtype": "float16",
+        "max_model_len": max_model_len,
+        "enable_lora": True,
+        "max_lora_rank": max_r,
+        "seed": seed,
+    }
+    if gpu_mem_util is not None:
+        llm_kwargs["gpu_memory_utilization"] = gpu_mem_util
+    if enforce_eager is not None:
+        llm_kwargs["enforce_eager"] = enforce_eager
+    llm = LLM(**llm_kwargs)
     sp = SamplingParams(temperature=temperature, top_p=1.0, max_tokens=max_tokens)
 
     if max_samples is None or int(max_samples) < 0:

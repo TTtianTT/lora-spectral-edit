@@ -5,7 +5,10 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:  # pragma: no cover
+    snapshot_download = None
 
 
 MATH_LORAS = [
@@ -46,6 +49,10 @@ def build_configs(run_root: Path, adapter_map: dict, eval_max_samples: int) -> l
         "noise_frac": 0.2,
         "amp_factor": 1.25,
         "sup_factor": 0.80,
+        "mid_factor": 1.0,
+        "smooth_temperature": 0.35,
+        "smooth_center_q": 0.5,
+        "smooth_align_mid": True,
         "preserve_energy": "l1",
         "calib_samples": 256,
         "calib_batch_size": 2,
@@ -81,12 +88,14 @@ def build_configs(run_root: Path, adapter_map: dict, eval_max_samples: int) -> l
         add_run("gsm8k_full", repo_id, "baseline", 0)
         for seed in [42, 43, 44]:
             add_run("gsm8k_full", repo_id, "abs_select", seed)
+            add_run("gsm8k_full", repo_id, "smooth_abs", seed)
             add_run("gsm8k_full", repo_id, "random_index", seed)
 
     for repo_id in CODE_LORAS:
         add_run("humaneval_full", repo_id, "baseline", 0)
         for seed in [42, 43, 44]:
             add_run("humaneval_full", repo_id, "abs_select", seed)
+            add_run("humaneval_full", repo_id, "smooth_abs", seed)
             add_run("humaneval_full", repo_id, "random_index", seed)
 
     return configs
@@ -94,7 +103,7 @@ def build_configs(run_root: Path, adapter_map: dict, eval_max_samples: int) -> l
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prefetch LoRA adapters into HF cache and write config mapping."
+        description="Prefetch LoRA adapters into HF cache and write configs JSONL."
     )
     parser.add_argument(
         "--run-root",
@@ -127,12 +136,21 @@ def main() -> None:
 
     adapter_map = {}
     for repo_id in MATH_LORAS + CODE_LORAS:
+        if snapshot_download is None:
+            adapter_map[repo_id] = repo_id
+            continue
         path = snapshot_download(
             repo_id=repo_id,
             local_dir=None,
             local_files_only=bool(args.local_only),
         )
         adapter_map[repo_id] = path
+
+    if snapshot_download is None:
+        print(
+            "[Prefetch] huggingface_hub not installed; "
+            "writing configs with lora_local_path=<repo_id> (will download at runtime)."
+        )
 
     mapping_path = run_root / "adapter_cache_map.json"
     with mapping_path.open("w", encoding="utf-8") as f:

@@ -151,6 +151,11 @@ Uses absolute gradient magnitude |g_sigma| as sensitivity score:
 
 This is NOT gradient descent. It's feature selection based on sensitivity.
 
+### random_index (Control)
+
+Uses the same core/noise counts and amp/sup factors as `abs_select`,
+but selects indices uniformly at random (seeded).
+
 ### gd (Gradient Descent)
 
 Uses signed gradient for updates:
@@ -158,6 +163,35 @@ Uses signed gradient for updates:
 - `multiplicative`: σ_new = σ * exp(-η * g)
 
 Can use asymmetric step sizes for positive/negative gradients.
+
+## Experiments
+
+### Multi-GPU full eval runs
+
+1) Prefetch adapters and generate configs:
+
+```bash
+python scripts/prefetch_adapters.py
+```
+
+2) Launch runs (tmux or nohup recommended):
+
+```bash
+tmux new -s lora_runs
+bash scripts/launch_multi_gpu.sh --gpus "0,1,2,3,4,5,7"
+```
+
+Or:
+
+```bash
+nohup bash scripts/launch_multi_gpu.sh --gpus "0,1,2,3,4,5,7" > _runs/<timestamp>/logs/launch.log 2>&1 &
+```
+
+3) Collect summaries:
+
+```bash
+python scripts/collect_results.py --run-root _runs/<timestamp>
+```
 
 ## Requirements
 

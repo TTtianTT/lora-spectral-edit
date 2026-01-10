@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
+
 CONFIG_LINE="${1:-}"
 GPU_ID="${2:-}"
 
@@ -41,6 +44,10 @@ emit("AMP_FACTOR", cfg.get("amp_factor", 1.25))
 emit("SUP_FACTOR", cfg.get("sup_factor", 0.80))
 emit("PRESERVE_ENERGY", cfg.get("preserve_energy", "l1"))
 emit("MID_FACTOR", cfg.get("mid_factor", 1.0))
+
+emit("SMOOTH_TEMPERATURE", cfg.get("smooth_temperature", 0.35))
+emit("SMOOTH_CENTER_Q", cfg.get("smooth_center_q", 0.5))
+emit("SMOOTH_ALIGN_MID", str(bool(cfg.get("smooth_align_mid", True))))
 
 emit("EVAL_FEWSHOT", int(cfg.get("eval_fewshot", 5)))
 emit("EVAL_MAX_SAMPLES", int(cfg.get("eval_max_samples", -1)))
@@ -97,6 +104,10 @@ trap cleanup EXIT
   ADAPTER_PATH="${LORA_LOCAL_PATH}"
   if [[ "${EDIT_MODE}" != "baseline" ]]; then
     rm -rf "${TMP_ADAPTER_DIR}"
+    EDIT_ARGS=()
+    if [[ "${SMOOTH_ALIGN_MID}" == "False" || "${SMOOTH_ALIGN_MID}" == "false" ]]; then
+      EDIT_ARGS+=(--no_smooth_align_mid)
+    fi
     CUDA_VISIBLE_DEVICES="${GPU_ID}" python -m lora_spectral_edit edit \
       --base_model "${BASE_MODEL}" \
       --lora_path "${LORA_LOCAL_PATH}" \
@@ -108,6 +119,9 @@ trap cleanup EXIT
       --amp_factor "${AMP_FACTOR}" \
       --sup_factor "${SUP_FACTOR}" \
       --mid_factor "${MID_FACTOR}" \
+      --smooth_temperature "${SMOOTH_TEMPERATURE}" \
+      --smooth_center_q "${SMOOTH_CENTER_Q}" \
+      "${EDIT_ARGS[@]}" \
       --preserve_energy "${PRESERVE_ENERGY}" \
       --calib_samples "${CALIB_SAMPLES}" \
       --calib_batch_size "${CALIB_BATCH_SIZE}" \

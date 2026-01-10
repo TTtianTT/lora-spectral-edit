@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
 CONFIGS_FILE="${ROOT_DIR}/experiments/configs_full.jsonl"
 GPUS="0,1,2,3,4,5,7"
 

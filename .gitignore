@@ -89,5 +89,10 @@ venv.bak/
 *.safetensors
 metamath_edited/
 edited_lora/
+
+# Run artifacts
 _runs/
 _smoke/
+*.log
+*.log.gz
+adapter_cache_map.json

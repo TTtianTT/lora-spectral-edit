@@ -1,9 +1,5 @@
 """
 Spectral editing strategies for LoRA singular values.
-
-Adds a new mode:
-- "smooth_abs": smooth, continuous scaling based on |g_sigma| via a sigmoid gate,
-                with optional alignment so gate(center)=mid_factor.
 """
 
 from dataclasses import dataclass
@@ -15,12 +11,10 @@ import torch
 @dataclass
 class EditConfig:
     """Configuration for spectral editing."""
-    # Sensitivity mode: "abs_select" (recommended), "smooth_abs", or "gd"
+    # Sensitivity mode: "abs_select" (recommended), "smooth_abs", "random_index", or "gd"
     mode: str = "abs_select"
 
-    # -------------------------
     # abs_select mode parameters
-    # -------------------------
     core_frac: float = 0.2      # Fraction of dims with largest |g| to amplify
     noise_frac: float = 0.2     # Fraction of dims with smallest |g| to suppress
     amp_factor: float = 1.25    # Multiplicative factor for core dims
@@ -28,16 +22,12 @@ class EditConfig:
     mid_factor: float = 1.0     # Multiplicative factor for middle dims
     min_core_k: int = 1         # Minimum number of core dims
 
-    # -------------------------
     # smooth_abs mode parameters
-    # -------------------------
     smooth_temperature: float = 0.35   # larger -> smoother/flatter; smaller -> sharper
     smooth_center_q: float = 0.5       # center quantile (0.5 = median)
     smooth_align_mid: bool = True      # enforce gate(center)=mid_factor if feasible
 
-    # -------------------------
     # gd mode parameters
-    # -------------------------
     eta: float = 0.2            # Learning rate for gradient update
     update_mode: str = "multiplicative"  # "additive" or "multiplicative"
     asymmetric_update: bool = True
@@ -45,11 +35,9 @@ class EditConfig:
     eta_enhance: float = 0.2    # Step size for g<0
     pos_power: float = 1.0      # Nonlinearity for positive grads
 
-    # -------------------------
     # Common parameters
-    # -------------------------
-    grad_norm: str = "mean_abs"   # "none", "mean_abs", or "l2"
-    preserve_energy: str = "l1"   # "none", "l1", or "l2"
+    grad_norm: str = "mean_abs"  # "none", "mean_abs", or "l2"
+    preserve_energy: str = "l1"  # "none", "l1", or "l2"
     sigma_clip_min: float = 0.0
 
 
@@ -107,16 +95,25 @@ def apply_smooth_abs(
     config: EditConfig,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
-    Smooth scaling based on |g| using a sigmoid gate.
+    Smooth, continuous scaling based on |g| using a sigmoid gate.
 
-    gate_i in [sup_factor, amp_factor], monotonic in |g|.
-    Optionally align the center quantile so that gate(center)=mid_factor.
+    Inputs:
+        x_i = normalize(|g_i|)  (caller should pass normalized g_abs)
+
+    Mapping:
+        gate_i = sup + (amp - sup) * sigmoid((x_i - mu) / tau)
+
+    Where:
+        center = quantile(x, smooth_center_q)  (default median)
+        scale = quantile(x, 1 - core_frac) - quantile(x, noise_frac)
+        tau = smooth_temperature * scale
+
+    Optional:
+        Adjust mu so that gate(center) == mid_factor (if sup < mid < amp).
     """
-    # Use float32 for quantiles/stability, keep device
     x = g_abs.to(dtype=torch.float32)
     r = int(x.numel())
 
-    # Degenerate case: all (almost) identical => do nothing (mid_factor)
     if (x.max() - x.min()).abs().item() < 1e-12:
         gate = torch.full_like(sigma0, float(config.mid_factor))
         return sigma0 * gate, {
@@ -127,7 +124,6 @@ def apply_smooth_abs(
             "gate_max": float(gate.max().item()),
         }
 
-    # Robust span using quantiles tied to noise/core fractions
     q_lo = float(max(0.0, min(1.0, config.noise_frac)))
     q_hi = float(max(0.0, min(1.0, 1.0 - config.core_frac)))
     if q_hi <= q_lo:
@@ -137,30 +133,25 @@ def apply_smooth_abs(
     hi = torch.quantile(x, q_hi)
     scale = (hi - lo).clamp_min(1e-8)
 
-    # Center point (default median)
     center_q = float(max(0.0, min(1.0, config.smooth_center_q)))
     center = torch.quantile(x, center_q)
 
-    # Temperature in units of robust scale
     tau = (float(config.smooth_temperature) * scale).clamp_min(1e-8)
-
-    # Shift mu: optionally enforce gate(center)=mid_factor (if feasible)
     mu = center
+
     if config.smooth_align_mid:
         sup = float(config.sup_factor)
         amp = float(config.amp_factor)
         mid = float(config.mid_factor)
-
         if amp > sup and (sup < mid < amp):
-            p = (mid - sup) / (amp - sup)  # desired sigmoid output at x=center
-            p = float(max(1e-4, min(1.0 - 1e-4, p)))  # avoid inf logit
+            p = (mid - sup) / (amp - sup)
+            p = float(max(1e-4, min(1.0 - 1e-4, p)))
             p_t = torch.tensor(p, device=x.device, dtype=torch.float32)
             logit = torch.log(p_t) - torch.log(1.0 - p_t)
-            mu = center - tau * logit  # ensures gate(center)=mid
+            mu = center - tau * logit
 
     sup_t = torch.tensor(float(config.sup_factor), device=x.device, dtype=torch.float32)
     amp_t = torch.tensor(float(config.amp_factor), device=x.device, dtype=torch.float32)
-
     gate = sup_t + (amp_t - sup_t) * torch.sigmoid((x - mu) / tau)
     gate = gate.to(dtype=sigma0.dtype)
 
@@ -183,6 +174,39 @@ def apply_smooth_abs(
     return sigma_new, stats
 
 
+def apply_random_index(
+    sigma0: torch.Tensor,
+    config: EditConfig,
+) -> Tuple[torch.Tensor, int, int]:
+    """
+    Apply random index selection with the same counts as abs_select.
+
+    Randomly chooses core/noise indices uniformly, then applies amp/sup factors.
+    """
+    r = int(sigma0.numel())
+
+    k_core = max(int(round(r * config.core_frac)), config.min_core_k)
+    k_core = min(k_core, r)
+
+    k_noise = int(round(r * config.noise_frac))
+    k_noise = max(0, min(k_noise, r - k_core))
+
+    order = torch.randperm(r, device=sigma0.device)
+    core_idx = order[:k_core]
+    noise_idx = (
+        order[k_core:k_core + k_noise]
+        if k_noise > 0
+        else torch.empty(0, dtype=torch.long, device=sigma0.device)
+    )
+
+    gate = torch.full_like(sigma0, float(config.mid_factor))
+    gate[core_idx] = float(config.amp_factor)
+    if k_noise > 0:
+        gate[noise_idx] = float(config.sup_factor)
+
+    return sigma0 * gate, k_core, k_noise
+
+
 def apply_gd_update(
     sigma0: torch.Tensor,
     g: torch.Tensor,
@@ -193,10 +217,10 @@ def apply_gd_update(
     """
     if config.asymmetric_update:
         g_pos = torch.relu(g)
-        g_neg = -torch.relu(-g)  # <= 0
+        g_neg = -torch.relu(-g)
         if config.pos_power != 1.0:
-            g_pos = g_pos.pow(float(config.pos_power))
-        g_eff = float(config.eta_suppress) * g_pos + float(config.eta_enhance) * g_neg
+            g_pos = g_pos.pow(config.pos_power)
+        g_eff = config.eta_suppress * g_pos + config.eta_enhance * g_neg
 
         if config.update_mode == "additive":
             return sigma0 - g_eff
@@ -204,9 +228,9 @@ def apply_gd_update(
             return sigma0 * torch.exp(-g_eff)
     else:
         if config.update_mode == "additive":
-            return sigma0 - float(config.eta) * g
+            return sigma0 - config.eta * g
         else:
-            return sigma0 * torch.exp(-float(config.eta) * g)
+            return sigma0 * torch.exp(-config.eta * g)
 
 
 def preserve_spectral_energy(
@@ -240,7 +264,7 @@ def apply_spectral_edit(
         config: EditConfig with editing parameters
 
     Returns:
-        (sigma_new, stats_dict)
+        Tuple of (sigma_new, stats_dict) where stats_dict contains editing statistics.
     """
     if config is None:
         config = EditConfig()
@@ -248,7 +272,7 @@ def apply_spectral_edit(
     g = g_sigma.clone()
     g_abs = g.abs()
 
-    # Normalize gradient (abs + signed)
+    # Normalize gradient
     g_abs_norm = normalize_gradient(g_abs, config.grad_norm)
     g_norm = normalize_gradient(g, config.grad_norm)
 
@@ -268,14 +292,21 @@ def apply_spectral_edit(
             "sup_factor": float(config.sup_factor),
             "mid_factor": float(config.mid_factor),
         })
-
     elif config.mode == "smooth_abs":
         sigma_new, smooth_stats = apply_smooth_abs(sigma0, g_abs_norm, config)
         stats.update(smooth_stats)
         stats["k_core"] = None
         stats["k_noise"] = None
-
-    else:  # "gd"
+    elif config.mode == "random_index":
+        sigma_new, k_core, k_noise = apply_random_index(sigma0, config)
+        stats.update({
+            "k_core": int(k_core),
+            "k_noise": int(k_noise),
+            "amp_factor": float(config.amp_factor),
+            "sup_factor": float(config.sup_factor),
+            "mid_factor": float(config.mid_factor),
+        })
+    else:
         sigma_new = apply_gd_update(sigma0, g_norm, config)
         stats["k_core"] = None
         stats["k_noise"] = None
