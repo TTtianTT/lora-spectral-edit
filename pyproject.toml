@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lora-spectral-edit"
+version = "0.1.0"
+description = "Sensitivity-based spectral editing for LoRA adapters"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "SimpleGuard Authors"}
+]
+keywords = ["lora", "llm", "fine-tuning", "spectral", "svd", "peft"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.35",
+    "peft>=0.6",
+    "datasets",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+eval = [
+    "vllm>=0.4.0",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.scripts]
+lora-spectral-edit = "lora_spectral_edit.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/TTtianTT/SimpleGuard"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
