@@ -89,3 +89,5 @@ venv.bak/
 *.safetensors
 metamath_edited/
 edited_lora/
+_runs/
+_smoke/

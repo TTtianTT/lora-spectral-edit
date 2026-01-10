@@ -238,6 +238,9 @@ def run_edit(args):
         sup_factor=args.sup_factor,
         mid_factor=args.mid_factor,
         min_core_k=args.min_core_k,
+        smooth_temperature=args.smooth_temperature,
+        smooth_center_q=args.smooth_center_q,
+        smooth_align_mid=not args.no_smooth_align_mid,
         eta=args.eta,
         update_mode=args.update_mode,
         asymmetric_update=args.asymmetric_update,
@@ -387,8 +390,8 @@ def main():
     edit_parser.add_argument("--calib_batch_size", type=int, default=2,
                              help="Calibration batch size")
 
-    edit_parser.add_argument("--mode", type=str, choices=["abs_select", "gd"], default="abs_select",
-                             help="Edit mode: abs_select (sensitivity-based) or gd (gradient descent)")
+    edit_parser.add_argument("--mode", type=str, choices=["abs_select", "smooth_abs", "gd"], default="abs_select",
+                             help="Edit mode: abs_select, smooth_abs, or gd")
     edit_parser.add_argument("--core_frac", type=float, default=0.2,
                              help="Fraction of dims to amplify (abs_select mode)")
     edit_parser.add_argument("--noise_frac", type=float, default=0.2,
@@ -401,6 +404,13 @@ def main():
                              help="Scale factor for middle dims")
     edit_parser.add_argument("--min_core_k", type=int, default=1,
                              help="Minimum number of core dims per module")
+
+    edit_parser.add_argument("--smooth_temperature", type=float, default=0.35,
+                             help="Smoothness for smooth_abs mode (larger=smoother, smaller=sharper)")
+    edit_parser.add_argument("--smooth_center_q", type=float, default=0.5,
+                             help="Center quantile for smooth_abs mode (0.5=median)")
+    edit_parser.add_argument("--no_smooth_align_mid", action="store_true",
+                             help="Disable aligning gate(center)=mid_factor in smooth_abs mode")
 
     edit_parser.add_argument("--eta", type=float, default=0.2,
                              help="Learning rate (gd mode)")

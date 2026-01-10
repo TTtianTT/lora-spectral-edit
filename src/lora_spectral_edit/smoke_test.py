@@ -115,6 +115,50 @@ def test_spectral_edit_gd():
     print("   PASSED")
 
 
+def test_spectral_edit_smooth_abs():
+    """Test smooth_abs editing mode."""
+    print("[Test] Spectral edit (smooth_abs mode)...")
+
+    r = 33
+    sigma0 = torch.ones(r)
+    g_sigma = torch.linspace(-2.0, 2.0, r)
+
+    config = EditConfig(
+        mode="smooth_abs",
+        core_frac=0.2,
+        noise_frac=0.2,
+        amp_factor=1.5,
+        sup_factor=0.5,
+        mid_factor=1.0,
+        smooth_temperature=0.25,
+        smooth_center_q=0.5,
+        smooth_align_mid=True,
+        grad_norm="none",
+        preserve_energy="none",
+    )
+
+    sigma_new, stats = apply_spectral_edit(sigma0, g_sigma, config)
+
+    assert sigma_new.shape == sigma0.shape, "Output shape mismatch"
+    assert stats["mode"] == "smooth_abs", f"Expected mode smooth_abs, got {stats['mode']}"
+    assert stats["degenerate"] is False, "Expected non-degenerate gradients"
+
+    sup = config.sup_factor
+    amp = config.amp_factor
+    assert stats["gate_min"] >= sup - 1e-6, f"gate_min out of range: {stats['gate_min']}"
+    assert stats["gate_max"] <= amp + 1e-6, f"gate_max out of range: {stats['gate_max']}"
+
+    # Check alignment: gate(center) ~= mid_factor
+    center = torch.tensor(stats["center"])
+    mu = torch.tensor(stats["mu"])
+    tau = torch.tensor(stats["tau"]).clamp_min(1e-8)
+    p = torch.sigmoid((center - mu) / tau)
+    gate_center = sup + (amp - sup) * float(p.item())
+    assert abs(gate_center - config.mid_factor) < 1e-3, f"Alignment failed: {gate_center}"
+
+    print("   PASSED")
+
+
 def test_io_imports():
     """Test that IO module imports work."""
     print("[Test] IO module imports...")
@@ -149,6 +193,7 @@ def run_smoke_test():
     try:
         test_svd_roundtrip()
         test_spectral_edit_abs_select()
+        test_spectral_edit_smooth_abs()
         test_spectral_edit_gd()
         test_io_imports()
 
