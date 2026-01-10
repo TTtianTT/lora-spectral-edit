@@ -49,6 +49,10 @@ emit("SMOOTH_TEMPERATURE", cfg.get("smooth_temperature", 0.35))
 emit("SMOOTH_CENTER_Q", cfg.get("smooth_center_q", 0.5))
 emit("SMOOTH_ALIGN_MID", str(bool(cfg.get("smooth_align_mid", True))))
 
+# Spectral gate sweep parameters
+emit("SOFT_TEMPERATURE", cfg.get("soft_temperature", ""))
+emit("SOFT_PIVOT_MODE", cfg.get("soft_pivot_mode", ""))
+
 emit("EVAL_FEWSHOT", int(cfg.get("eval_fewshot", 5)))
 emit("EVAL_MAX_SAMPLES", int(cfg.get("eval_max_samples", -1)))
 emit("EVAL_TEMPERATURE", cfg.get("eval_temperature", 0.0))
@@ -102,7 +106,8 @@ trap cleanup EXIT
   echo "lora_local_path: ${LORA_LOCAL_PATH}" >> "${ADAPTER_REF}"
 
   ADAPTER_PATH="${LORA_LOCAL_PATH}"
-  if [[ "${EDIT_MODE}" != "baseline" ]]; then
+  if [[ "${EDIT_MODE}" != "baseline" && "${EDIT_MODE}" != "spectral_gate" ]]; then
+    # spectral_gate mode uses spectral_gate_humaneval_greedy.py which handles edit+eval together
     rm -rf "${TMP_ADAPTER_DIR}"
     EDIT_ARGS=()
     if [[ "${SMOOTH_ALIGN_MID}" == "False" || "${SMOOTH_ALIGN_MID}" == "false" ]]; then
@@ -142,15 +147,40 @@ trap cleanup EXIT
       --out_json "${OUT_DIR}/metrics.json"
   elif [[ "${TASK}" == "humaneval_full" ]]; then
     rm -rf "${EVAL_TMP_DIR}"
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" python -m lora_spectral_edit.eval_humaneval \
-      --base_model_id "${BASE_MODEL}" \
-      --lora_dir "${ADAPTER_PATH}" \
-      --max_samples "${EVAL_MAX_SAMPLES}" \
-      --temperature "${EVAL_TEMPERATURE}" \
-      --max_tokens "${EVAL_MAX_TOKENS}" \
-      --seed "${SEED}" \
-      --out_json "${OUT_DIR}/metrics.json" \
-      --out_dir "${EVAL_TMP_DIR}"
+    if [[ "${EDIT_MODE}" == "spectral_gate" ]]; then
+      # Use spectral_gate_humaneval_greedy.py for spectral_gate sweep runs
+      SPECTRAL_GATE_ARGS=()
+      if [[ -n "${SOFT_TEMPERATURE}" ]]; then
+        SPECTRAL_GATE_ARGS+=(--soft_temperature "${SOFT_TEMPERATURE}")
+      fi
+      if [[ -n "${SOFT_PIVOT_MODE}" ]]; then
+        SPECTRAL_GATE_ARGS+=(--soft_pivot_mode "${SOFT_PIVOT_MODE}")
+      fi
+      CUDA_VISIBLE_DEVICES="${GPU_ID}" python experiments/spectral_gate_humaneval_greedy.py \
+        --base_model_id "${BASE_MODEL}" \
+        --lora_path "${LORA_LOCAL_PATH}" \
+        --amp_factor "${AMP_FACTOR}" \
+        --sup_factor "${SUP_FACTOR}" \
+        "${SPECTRAL_GATE_ARGS[@]}" \
+        --calib_samples "${CALIB_SAMPLES}" \
+        --calib_batch_size "${CALIB_BATCH_SIZE}" \
+        --seed "${SEED}" \
+        --max_samples "${EVAL_MAX_SAMPLES}" \
+        --temperature "${EVAL_TEMPERATURE}" \
+        --max_tokens "${EVAL_MAX_TOKENS}" \
+        --out_dir "${OUT_DIR}" \
+        --out_json "${OUT_DIR}/metrics.json"
+    else
+      CUDA_VISIBLE_DEVICES="${GPU_ID}" python -m lora_spectral_edit.eval_humaneval \
+        --base_model_id "${BASE_MODEL}" \
+        --lora_dir "${ADAPTER_PATH}" \
+        --max_samples "${EVAL_MAX_SAMPLES}" \
+        --temperature "${EVAL_TEMPERATURE}" \
+        --max_tokens "${EVAL_MAX_TOKENS}" \
+        --seed "${SEED}" \
+        --out_json "${OUT_DIR}/metrics.json" \
+        --out_dir "${EVAL_TMP_DIR}"
+    fi
     rm -rf "${EVAL_TMP_DIR}"
   else
     echo "[Error] Unknown task: ${TASK}" >&2
