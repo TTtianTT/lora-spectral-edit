@@ -241,6 +241,10 @@ def run_edit(args):
         smooth_temperature=args.smooth_temperature,
         smooth_center_q=args.smooth_center_q,
         smooth_align_mid=not args.no_smooth_align_mid,
+        z_high=args.z_high,
+        z_low=args.z_low,
+        z_tau=args.z_tau,
+        z_fallback_std=args.z_fallback_std,
         eta=args.eta,
         update_mode=args.update_mode,
         asymmetric_update=args.asymmetric_update,
@@ -753,9 +757,11 @@ def main():
     edit_parser.add_argument("--calib_batch_size", type=int, default=2,
                              help="Calibration batch size")
 
-    edit_parser.add_argument("--mode", type=str, choices=["abs_select", "smooth_abs", "random_index", "gd"],
+    edit_parser.add_argument("--mode", "--edit_mode", type=str,
+                             choices=["abs_select", "smooth_abs", "double_smooth", "z_score",
+                                      "random_index", "gd"],
                              default="abs_select",
-                             help="Edit mode: abs_select, smooth_abs, random_index, or gd")
+                             help="Edit mode: abs_select, smooth_abs, double_smooth, z_score, random_index, or gd")
     edit_parser.add_argument("--core_frac", type=float, default=0.2,
                              help="Fraction of dims to amplify (abs_select mode)")
     edit_parser.add_argument("--noise_frac", type=float, default=0.2,
@@ -770,11 +776,20 @@ def main():
                              help="Minimum number of core dims per module")
 
     edit_parser.add_argument("--smooth_temperature", type=float, default=0.35,
-                             help="Smoothness for smooth_abs (larger=smoother, smaller=sharper)")
+                             help="Smoothness for smooth_abs/double_smooth (larger=smoother, smaller=sharper)")
     edit_parser.add_argument("--smooth_center_q", type=float, default=0.5,
                              help="Center quantile for smooth_abs (0.5=median)")
     edit_parser.add_argument("--no_smooth_align_mid", action="store_true",
                              help="Disable aligning gate(center)=mid_factor in smooth_abs")
+
+    edit_parser.add_argument("--z_high", type=float, default=1.0,
+                             help="Z-score threshold for amplification (z_score mode)")
+    edit_parser.add_argument("--z_low", type=float, default=-0.5,
+                             help="Z-score threshold for suppression (z_score mode)")
+    edit_parser.add_argument("--z_tau", type=float, default=0.2,
+                             help="Temperature for z-score gating (z_score mode)")
+    edit_parser.add_argument("--z_fallback_std", type=float, default=1e-6,
+                             help="Stddev floor that triggers z_score fallback")
 
     edit_parser.add_argument("--eta", type=float, default=0.2,
                              help="Learning rate (gd mode)")

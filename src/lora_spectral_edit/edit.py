@@ -11,7 +11,8 @@ import torch
 @dataclass
 class EditConfig:
     """Configuration for spectral editing."""
-    # Sensitivity mode: "abs_select" (recommended), "smooth_abs", "random_index", or "gd"
+    # Sensitivity mode: "abs_select" (recommended), "smooth_abs", "double_smooth",
+    # "z_score", "random_index", or "gd"
     mode: str = "abs_select"
 
     # abs_select mode parameters
@@ -22,10 +23,16 @@ class EditConfig:
     mid_factor: float = 1.0     # Multiplicative factor for middle dims
     min_core_k: int = 1         # Minimum number of core dims
 
-    # smooth_abs mode parameters
+    # smooth_abs / double_smooth mode parameters
     smooth_temperature: float = 0.35   # larger -> smoother/flatter; smaller -> sharper
     smooth_center_q: float = 0.5       # center quantile (0.5 = median)
     smooth_align_mid: bool = True      # enforce gate(center)=mid_factor if feasible
+
+    # z_score mode parameters
+    z_high: float = 1.0
+    z_low: float = -0.5
+    z_tau: float = 0.2
+    z_fallback_std: float = 1e-6
 
     # gd mode parameters
     eta: float = 0.2            # Learning rate for gradient update
@@ -174,6 +181,119 @@ def apply_smooth_abs(
     return sigma_new, stats
 
 
+def apply_double_smooth(
+    sigma0: torch.Tensor,
+    g_abs: torch.Tensor,
+    config: EditConfig,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Smooth double-sided sigmoid gate based on |g|.
+
+    Uses low |g| to suppress, high |g| to amplify, with a smooth mid region.
+    """
+    x = g_abs.to(dtype=torch.float32)
+    r = int(x.numel())
+
+    q_noise = float(max(0.0, min(1.0, config.noise_frac)))
+    q_core = float(max(0.0, min(1.0, 1.0 - config.core_frac)))
+    if q_noise >= q_core:
+        q_noise, q_core = 0.45, 0.55
+
+    threshold_noise = torch.quantile(x, q_noise)
+    threshold_core = torch.quantile(x, q_core)
+
+    data_range = (x.max() - x.min()).clamp_min(1e-8)
+    tau = (float(config.smooth_temperature) * data_range).clamp_min(1e-8)
+
+    mid = float(config.mid_factor)
+    sup = float(config.sup_factor)
+    amp = float(config.amp_factor)
+    delta_sup = mid - sup
+    delta_amp = amp - mid
+
+    gate_suppress = torch.sigmoid((threshold_noise - x) / tau)
+    gate_amplify = torch.sigmoid((x - threshold_core) / tau)
+    gate = mid - delta_sup * gate_suppress + delta_amp * gate_amplify
+    gate = gate.to(dtype=sigma0.dtype)
+
+    sigma_new = sigma0 * gate
+    stats: Dict[str, Any] = {
+        "r": r,
+        "mode": "double_smooth",
+        "threshold_noise": float(threshold_noise.item()),
+        "threshold_core": float(threshold_core.item()),
+        "tau": float(tau.item()),
+        "gate_min": float(gate.min().item()),
+        "gate_max": float(gate.max().item()),
+    }
+    return sigma_new, stats
+
+
+def apply_z_score_gate(
+    sigma0: torch.Tensor,
+    g_abs: torch.Tensor,
+    config: EditConfig,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Adaptive z-score gating using a double sigmoid in z-space.
+    """
+    x = g_abs.to(dtype=torch.float32)
+    r = int(x.numel())
+
+    mu = x.mean()
+    std = x.std(unbiased=False)
+    std_clamped = std.clamp_min(1e-8)
+    z = (x - mu) / std_clamped
+
+    z_abs_max = z.abs().max()
+    fallback = bool(float(std.item()) < float(config.z_fallback_std) or float(z_abs_max.item()) < 1e-3)
+
+    if fallback:
+        gate = torch.ones_like(sigma0, dtype=sigma0.dtype)
+        sigma_new = sigma0
+        z_for_counts = torch.zeros_like(z)
+    else:
+        mid = float(config.mid_factor)
+        amp = float(config.amp_factor)
+        sup = float(config.sup_factor)
+        tau = max(1e-8, float(config.z_tau))
+        z_high = float(config.z_high)
+        z_low = float(config.z_low)
+
+        delta_amp = amp - mid
+        delta_sup = mid - sup
+        gate_amp = torch.sigmoid((z - z_high) / tau)
+        gate_sup = torch.sigmoid((z_low - z) / tau)
+        gate = mid + delta_amp * gate_amp - delta_sup * gate_sup
+        gate = gate.to(dtype=sigma0.dtype)
+
+        sigma_new = sigma0 * gate
+        z_for_counts = z
+
+    k_core_eff = int((z_for_counts > float(config.z_high)).sum().item()) if r > 0 else 0
+    k_noise_eff = int((z_for_counts < float(config.z_low)).sum().item()) if r > 0 else 0
+    frac_core = float(k_core_eff) / r if r > 0 else 0.0
+    frac_noise = float(k_noise_eff) / r if r > 0 else 0.0
+
+    stats: Dict[str, Any] = {
+        "r": r,
+        "mode": "z_score",
+        "mu": float(mu.item()),
+        "std": float(std.item()),
+        "z_high": float(config.z_high),
+        "z_low": float(config.z_low),
+        "tau": float(config.z_tau),
+        "k_core_eff": k_core_eff,
+        "k_noise_eff": k_noise_eff,
+        "frac_core": frac_core,
+        "frac_noise": frac_noise,
+        "fallback": fallback,
+        "gate_min": float(gate.min().item()),
+        "gate_max": float(gate.max().item()),
+    }
+    return sigma_new, stats
+
+
 def apply_random_index(
     sigma0: torch.Tensor,
     config: EditConfig,
@@ -295,6 +415,16 @@ def apply_spectral_edit(
     elif config.mode == "smooth_abs":
         sigma_new, smooth_stats = apply_smooth_abs(sigma0, g_abs_norm, config)
         stats.update(smooth_stats)
+        stats["k_core"] = None
+        stats["k_noise"] = None
+    elif config.mode == "double_smooth":
+        sigma_new, smooth_stats = apply_double_smooth(sigma0, g_abs_norm, config)
+        stats.update(smooth_stats)
+        stats["k_core"] = None
+        stats["k_noise"] = None
+    elif config.mode == "z_score":
+        sigma_new, z_stats = apply_z_score_gate(sigma0, g_abs_norm, config)
+        stats.update(z_stats)
         stats["k_core"] = None
         stats["k_noise"] = None
     elif config.mode == "random_index":

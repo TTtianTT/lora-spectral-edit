@@ -49,6 +49,12 @@ emit("SMOOTH_TEMPERATURE", cfg.get("smooth_temperature", 0.35))
 emit("SMOOTH_CENTER_Q", cfg.get("smooth_center_q", 0.5))
 emit("SMOOTH_ALIGN_MID", str(bool(cfg.get("smooth_align_mid", True))))
 
+# z_score parameters
+emit("Z_HIGH", cfg.get("z_high", 1.0))
+emit("Z_LOW", cfg.get("z_low", -0.5))
+emit("Z_TAU", cfg.get("z_tau", 0.2))
+emit("Z_FALLBACK_STD", cfg.get("z_fallback_std", 1e-6))
+
 # Spectral gate sweep parameters
 emit("SOFT_TEMPERATURE", cfg.get("soft_temperature", ""))
 emit("SOFT_PIVOT_MODE", cfg.get("soft_pivot_mode", ""))
@@ -140,6 +146,10 @@ trap cleanup EXIT
       --mid_factor "${MID_FACTOR}" \
       --smooth_temperature "${SMOOTH_TEMPERATURE}" \
       --smooth_center_q "${SMOOTH_CENTER_Q}" \
+      --z_high "${Z_HIGH}" \
+      --z_low "${Z_LOW}" \
+      --z_tau "${Z_TAU}" \
+      --z_fallback_std "${Z_FALLBACK_STD}" \
       "${EDIT_ARGS[@]}" \
       --preserve_energy "${PRESERVE_ENERGY}" \
       --calib_samples "${CALIB_SAMPLES}" \
