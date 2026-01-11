@@ -230,10 +230,33 @@ def main() -> None:
         task = cfg.get("task", "unknown")
         metric_key, metric_value = extract_metric(task, metrics)
 
+        # Handle lora_repo_id: check both lora_repo_id and lora_path
+        lora_repo_id = cfg.get("lora_repo_id")
+        if not lora_repo_id:
+            lora_path = cfg.get("lora_path", "")
+            if "models--" in lora_path:
+                # Parse HuggingFace cache path format: models--org--repo
+                parts = lora_path.split("models--")[-1].split("/")[0]
+                lora_repo_id = parts.replace("--", "/")
+            elif lora_path:
+                lora_repo_id = Path(lora_path.rstrip("/")).name
+
+        # Handle edit_mode: infer from metrics if not in config
+        edit_mode = cfg.get("edit_mode")
+        if not edit_mode:
+            # Check if metrics has meta.edit_mode
+            meta = metrics.get("meta", {})
+            edit_mode = meta.get("edit_mode")
+
+        # Infer task from metrics meta if config doesn't have it
+        if task == "unknown":
+            meta = metrics.get("meta", {})
+            task = meta.get("task", task)
+
         row = {
             "task": task,
-            "lora_repo_id": cfg.get("lora_repo_id"),
-            "edit_mode": cfg.get("edit_mode"),
+            "lora_repo_id": lora_repo_id,
+            "edit_mode": edit_mode,
             "seed": cfg.get("seed"),
             "out_dir": str(metrics_path.parent),
             "metric_key": metric_key,

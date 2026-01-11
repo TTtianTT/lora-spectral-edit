@@ -57,6 +57,7 @@ emit("EVAL_FEWSHOT", int(cfg.get("eval_fewshot", 5)))
 emit("EVAL_MAX_SAMPLES", int(cfg.get("eval_max_samples", -1)))
 emit("EVAL_TEMPERATURE", cfg.get("eval_temperature", 0.0))
 emit("EVAL_MAX_TOKENS", int(cfg.get("eval_max_tokens", 512)))
+emit("EVAL_PROFILE", cfg.get("eval_profile", ""))
 
 target_modules = cfg.get("target_modules", [])
 emit("TARGET_MODULES", " ".join(target_modules))
@@ -71,6 +72,19 @@ if [[ -z "${OUT_DIR}" ]]; then
 fi
 
 mkdir -p "${OUT_DIR}"
+
+if [[ -z "${EVAL_PROFILE}" ]]; then
+  if [[ "${TASK}" == "gsm8k_full" ]]; then
+    EVAL_PROFILE="paper_math"
+  elif [[ "${TASK}" == "humaneval_full" ]]; then
+    EVAL_PROFILE="paper_code_main"
+  fi
+fi
+
+EVAL_PROFILE_ARGS=()
+if [[ -n "${EVAL_PROFILE}" ]]; then
+  EVAL_PROFILE_ARGS+=(--eval_profile "${EVAL_PROFILE}")
+fi
 
 python - <<'PY' "${CONFIG_LINE}" "${OUT_DIR}"
 import json
@@ -139,6 +153,7 @@ trap cleanup EXIT
     CUDA_VISIBLE_DEVICES="${GPU_ID}" python -m lora_spectral_edit eval \
       --base_model "${BASE_MODEL}" \
       --lora_dir "${ADAPTER_PATH}" \
+      "${EVAL_PROFILE_ARGS[@]}" \
       --fewshot "${EVAL_FEWSHOT}" \
       --max_samples "${EVAL_MAX_SAMPLES}" \
       --temperature "${EVAL_TEMPERATURE}" \
@@ -174,6 +189,7 @@ trap cleanup EXIT
       CUDA_VISIBLE_DEVICES="${GPU_ID}" python -m lora_spectral_edit.eval_humaneval \
         --base_model_id "${BASE_MODEL}" \
         --lora_dir "${ADAPTER_PATH}" \
+        "${EVAL_PROFILE_ARGS[@]}" \
         --max_samples "${EVAL_MAX_SAMPLES}" \
         --temperature "${EVAL_TEMPERATURE}" \
         --max_tokens "${EVAL_MAX_TOKENS}" \

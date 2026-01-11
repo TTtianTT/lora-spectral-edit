@@ -2,11 +2,16 @@
 GSM8K evaluation utilities using vLLM.
 
 This module is optional and requires vLLM to be installed.
+
+Supports evaluation profiles matching "LoRA Learns Less and Forgets Less" paper:
+- paper_math: 5-shot, greedy decoding, strict match accuracy (1319 test samples)
 """
 
 import os
 import re
-from typing import Optional, List
+import json
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
 from datasets import load_dataset
 
@@ -42,21 +47,27 @@ def extract_gsm8k_final_number(ans: str) -> Optional[str]:
     Extract the final answer number from GSM8K format.
 
     GSM8K answers end with '#### <number>'. Falls back to last integer if not found.
+    This implements strict-match parsing as per the paper.
     """
-    m = re.findall(r"####\s*(-?\d+)", ans)
+    # Primary: look for #### format (official GSM8K format)
+    m = re.findall(r"####\s*(-?\d[\d,]*)", ans)
     if m:
-        return m[-1]
-    m2 = re.findall(r"(-?\d+)", ans.replace(",", ""))
+        # Remove commas from number
+        return m[-1].replace(",", "")
+    # Fallback: last number in text
+    m2 = re.findall(r"(-?\d[\d,]*)", ans.replace(",", ""))
     return m2[-1] if m2 else None
 
 
 def pred_number(text: str) -> Optional[str]:
-    """Extract predicted number from model output."""
-    m = re.findall(r"####\s*(-?\d+)", text)
+    """Extract predicted number from model output using strict-match parsing."""
+    # Primary: look for #### format
+    m = re.findall(r"####\s*(-?\d[\d,]*)", text)
     if m:
-        return m[-1]
-    m2 = re.findall(r"(-?\d+)", text.replace(",", ""))
-    return m2[-1] if m2 else None
+        return m[-1].replace(",", "")
+    # Fallback: last number in text
+    m2 = re.findall(r"(-?\d[\d,]*)", text.replace(",", ""))
+    return m2[-1].replace(",", "") if m2 else None
 
 
 def build_gsm8k_fewshot_prefix(train_ds, k: int) -> str:
@@ -71,15 +82,83 @@ def build_gsm8k_fewshot_prefix(train_ds, k: int) -> str:
     return "\n".join(parts) + "\n"
 
 
+def write_eval_config(
+    out_dir: str,
+    task: str,
+    split: str,
+    num_fewshot: int,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    total_samples: int,
+    metric: str,
+    score: float,
+    correct: int,
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Write evaluation config summary to a JSON file in the run directory.
+
+    Args:
+        out_dir: Output directory
+        task: Task name (e.g., "gsm8k")
+        split: Dataset split (e.g., "test")
+        num_fewshot: Number of few-shot examples
+        temperature: Sampling temperature
+        top_p: Top-p sampling parameter
+        max_tokens: Max tokens to generate
+        total_samples: Total number of samples evaluated
+        metric: Metric name (e.g., "strict_match_accuracy")
+        score: Metric score
+        correct: Number of correct predictions
+        extra_meta: Additional metadata to include
+
+    Returns:
+        Path to the written config file
+    """
+    config = {
+        "task": task,
+        "split": split,
+        "num_fewshot": num_fewshot,
+        "decoding": {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_tokens": max_tokens,
+            "strategy": "greedy" if temperature == 0.0 else "sampling",
+        },
+        "total_samples": total_samples,
+        "metric": {
+            "name": metric,
+            "score": score,
+            "correct": correct,
+            "total": total_samples,
+        },
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    if extra_meta:
+        config["meta"] = extra_meta
+
+    os.makedirs(out_dir, exist_ok=True)
+    config_path = os.path.join(out_dir, "eval_config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+    return config_path
+
+
 def evaluate_gsm8k_vllm(
     base_model_id: str,
     lora_dir: str,
     fewshot_k: int = 5,
     max_samples: int = -1,
     temperature: float = 0.0,
+    top_p: float = 1.0,
     max_tokens: int = 512,
     seed: int = 0,
     max_model_len: int = 4096,
+    out_dir: Optional[str] = None,
+    write_config: bool = True,
 ) -> dict:
     """
     Evaluate a LoRA adapter on GSM8K using vLLM.
@@ -87,15 +166,18 @@ def evaluate_gsm8k_vllm(
     Args:
         base_model_id: HuggingFace model ID for the base model.
         lora_dir: Path to the LoRA adapter directory.
-        fewshot_k: Number of few-shot examples.
-        max_samples: Maximum number of test samples (-1 for all).
-        temperature: Sampling temperature (0 for greedy).
+        fewshot_k: Number of few-shot examples (paper_math: 5).
+        max_samples: Maximum number of test samples (-1 for all 1319).
+        temperature: Sampling temperature (0 for greedy, paper_math: 0.0).
+        top_p: Top-p sampling (paper_math: 1.0).
         max_tokens: Maximum tokens to generate.
         seed: Random seed.
         max_model_len: Maximum model context length.
+        out_dir: Output directory for config JSON (defaults to lora_dir).
+        write_config: Whether to write eval config JSON.
 
     Returns:
-        Dictionary with 'acc', 'correct', and 'total' keys.
+        Dictionary with 'acc', 'correct', 'total', and optionally 'config_path'.
     """
     check_vllm_available()
 
@@ -129,7 +211,7 @@ def evaluate_gsm8k_vllm(
     if enforce_eager is not None:
         llm_kwargs["enforce_eager"] = enforce_eager
     llm = LLM(**llm_kwargs)
-    sp = SamplingParams(temperature=temperature, top_p=1.0, max_tokens=max_tokens)
+    sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
 
     if max_samples is None or int(max_samples) < 0:
         eval_ds = test_ds
@@ -150,13 +232,105 @@ def evaluate_gsm8k_vllm(
 
     correct = 0
     total = len(gold_nums)
+    predictions = []
     for out, gold in zip(outputs, gold_nums):
         gen = out.outputs[0].text
         pred = pred_number(gen)
+        predictions.append({
+            "gold": gold,
+            "pred": pred,
+            "correct": gold is not None and pred == gold,
+            "generation": gen,
+        })
         if gold is not None and pred == gold:
             correct += 1
 
-    return {"acc": correct / total if total else 0.0, "correct": correct, "total": total}
+    acc = correct / total if total else 0.0
+    result = {"acc": acc, "correct": correct, "total": total}
+
+    # Write config JSON if requested
+    if write_config:
+        config_dir = out_dir if out_dir else lora_dir
+        config_path = write_eval_config(
+            out_dir=config_dir,
+            task="gsm8k",
+            split="test",
+            num_fewshot=fewshot_k,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            total_samples=total,
+            metric="strict_match_accuracy",
+            score=acc,
+            correct=correct,
+            extra_meta={
+                "base_model_id": base_model_id,
+                "lora_dir": lora_dir,
+                "seed": seed,
+                "max_model_len": max_model_len,
+            },
+        )
+        result["config_path"] = config_path
+
+        # Also write predictions for auditability
+        preds_path = os.path.join(config_dir, "gsm8k_predictions.jsonl")
+        with open(preds_path, "w", encoding="utf-8") as f:
+            for i, p in enumerate(predictions):
+                f.write(json.dumps({"idx": i, **p}, ensure_ascii=False) + "\n")
+        result["predictions_path"] = preds_path
+
+    return result
+
+
+def evaluate_gsm8k_with_profile(
+    base_model_id: str,
+    lora_dir: str,
+    profile_name: str = "paper_math",
+    max_samples: Optional[int] = None,
+    seed: int = 0,
+    max_model_len: int = 4096,
+    out_dir: Optional[str] = None,
+) -> dict:
+    """
+    Evaluate GSM8K using a predefined profile.
+
+    Args:
+        base_model_id: HuggingFace model ID for the base model.
+        lora_dir: Path to the LoRA adapter directory.
+        profile_name: Profile name ("paper_math" for paper settings).
+        max_samples: Override max samples (None uses profile default).
+        seed: Random seed.
+        max_model_len: Maximum model context length.
+        out_dir: Output directory for results.
+
+    Returns:
+        Dictionary with evaluation results and config.
+    """
+    from .eval_profiles import get_profile
+
+    profile = get_profile(profile_name)
+
+    if profile.task != "gsm8k":
+        raise ValueError(f"Profile '{profile_name}' is for task '{profile.task}', not gsm8k")
+
+    samples = max_samples if max_samples is not None else profile.max_samples
+
+    result = evaluate_gsm8k_vllm(
+        base_model_id=base_model_id,
+        lora_dir=lora_dir,
+        fewshot_k=profile.num_fewshot,
+        max_samples=samples,
+        temperature=profile.temperature,
+        top_p=profile.top_p,
+        max_tokens=profile.max_tokens,
+        seed=seed,
+        max_model_len=max_model_len,
+        out_dir=out_dir,
+        write_config=True,
+    )
+
+    result["profile"] = profile.get_summary()
+    return result
 
 
 def evaluate_both_loras(
@@ -166,9 +340,12 @@ def evaluate_both_loras(
     fewshot_k: int = 5,
     max_samples: int = -1,
     temperature: float = 0.0,
+    top_p: float = 1.0,
     max_tokens: int = 512,
     seed: int = 0,
     max_model_len: int = 4096,
+    out_dir: Optional[str] = None,
+    write_config: bool = True,
 ) -> dict:
     """
     Evaluate both baseline and edited LoRA adapters on GSM8K.
@@ -216,7 +393,7 @@ def evaluate_both_loras(
     if enforce_eager is not None:
         llm_kwargs["enforce_eager"] = enforce_eager
     llm = LLM(**llm_kwargs)
-    sp = SamplingParams(temperature=temperature, top_p=1.0, max_tokens=max_tokens)
+    sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
 
     if max_samples is None or int(max_samples) < 0:
         eval_ds = test_ds
@@ -239,12 +416,59 @@ def evaluate_both_loras(
         outputs = llm.generate(prompts, sp, lora_request=lora_req)
 
         correct = 0
+        predictions = []
         for out, gold in zip(outputs, gold_nums):
             gen = out.outputs[0].text
             pred = pred_number(gen)
-            if gold is not None and pred == gold:
+            is_correct = gold is not None and pred == gold
+            predictions.append({
+                "gold": gold,
+                "pred": pred,
+                "correct": is_correct,
+                "generation": gen,
+            })
+            if is_correct:
                 correct += 1
 
-        results[name] = {"acc": correct / total if total else 0.0, "correct": correct, "total": total}
+        acc = correct / total if total else 0.0
+        results[name] = {"acc": acc, "correct": correct, "total": total}
+
+        # Write predictions if out_dir specified
+        if write_config and out_dir:
+            preds_path = os.path.join(out_dir, f"gsm8k_predictions_{name}.jsonl")
+            os.makedirs(out_dir, exist_ok=True)
+            with open(preds_path, "w", encoding="utf-8") as f:
+                for i, p in enumerate(predictions):
+                    f.write(json.dumps({"idx": i, **p}, ensure_ascii=False) + "\n")
+            results[name]["predictions_path"] = preds_path
+
+    # Write combined config
+    if write_config and out_dir:
+        config = {
+            "task": "gsm8k",
+            "split": "test",
+            "num_fewshot": fewshot_k,
+            "decoding": {
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+                "strategy": "greedy" if temperature == 0.0 else "sampling",
+            },
+            "total_samples": total,
+            "baseline": results["baseline"],
+            "edited": results["edited"],
+            "meta": {
+                "base_model_id": base_model_id,
+                "baseline_lora_dir": baseline_lora_dir,
+                "edited_lora_dir": edited_lora_dir,
+                "seed": seed,
+                "max_model_len": max_model_len,
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+        config_path = os.path.join(out_dir, "eval_config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        results["config_path"] = config_path
 
     return results

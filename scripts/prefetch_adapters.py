@@ -79,6 +79,11 @@ def build_configs(run_root: Path, adapter_map: dict, eval_max_samples: int) -> l
         out_dir = run_root / task / slug / edit_mode
         if edit_mode != "baseline":
             out_dir = out_dir / f"seed_{seed}"
+        eval_profile = None
+        if task.startswith("gsm8k"):
+            eval_profile = "paper_math"
+        elif task.startswith("humaneval"):
+            eval_profile = "paper_code_main"
         cfg = {
             "task": task,
             "base_model": base_model,
@@ -89,6 +94,8 @@ def build_configs(run_root: Path, adapter_map: dict, eval_max_samples: int) -> l
             "out_dir": str(out_dir),
             "notes": "full_eval",
         }
+        if eval_profile:
+            cfg["eval_profile"] = eval_profile
         cfg.update(defaults)
         configs.append(cfg)
 
@@ -142,6 +149,7 @@ def build_humaneval_sweep_configs(
         "eval_temperature": 0.0,
         "eval_max_tokens": 512,
         "eval_max_samples": int(eval_max_samples),
+        "eval_profile": "paper_code_main",
         "keep_adapter": False,
         "run_root": str(run_root),
     }

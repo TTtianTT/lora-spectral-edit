@@ -183,6 +183,94 @@ def test_io_imports():
     print("   PASSED")
 
 
+def test_eval_profiles():
+    """Test evaluation profile system."""
+    print("[Test] Evaluation profiles...")
+
+    from .eval_profiles import (
+        get_profile,
+        list_profiles,
+        PAPER_MATH_PROFILE,
+        PAPER_CODE_MAIN_PROFILE,
+    )
+
+    # Test profile listing
+    profiles = list_profiles()
+    assert "paper_math" in profiles, "paper_math profile missing"
+    assert "paper_code_main" in profiles, "paper_code_main profile missing"
+    assert "greedy_math" in profiles, "greedy_math profile missing"
+    assert "greedy_code" in profiles, "greedy_code profile missing"
+
+    # Test paper_math profile settings
+    p = get_profile("paper_math")
+    assert p.task == "gsm8k", f"Expected task gsm8k, got {p.task}"
+    assert p.num_fewshot == 5, f"Expected 5-shot, got {p.num_fewshot}"
+    assert p.temperature == 0.0, f"Expected temp 0.0, got {p.temperature}"
+    assert p.n_generations == 1, f"Expected 1 gen, got {p.n_generations}"
+    assert p.metric == "accuracy", f"Expected accuracy metric, got {p.metric}"
+
+    # Test paper_code_main profile settings
+    p = get_profile("paper_code_main")
+    assert p.task == "humaneval", f"Expected task humaneval, got {p.task}"
+    assert p.num_fewshot == 0, f"Expected 0-shot, got {p.num_fewshot}"
+    assert p.n_generations == 50, f"Expected 50 gens, got {p.n_generations}"
+    assert p.temperature == 0.2, f"Expected temp 0.2, got {p.temperature}"
+    assert p.top_p == 0.95, f"Expected top_p 0.95, got {p.top_p}"
+    assert p.metric == "pass@k", f"Expected pass@k metric, got {p.metric}"
+    assert p.pass_k == 1, f"Expected pass@1, got pass@{p.pass_k}"
+
+    # Test profile summary
+    summary = p.get_summary()
+    assert summary["profile"] == "paper_code_main"
+    assert summary["n_generations"] == 50
+    assert summary["metric"] == "pass@1"
+
+    print(f"   Found {len(profiles)} profiles: {profiles}")
+    print("   PASSED")
+
+
+def test_pass_at_k_computation():
+    """Test pass@k unbiased estimator."""
+    print("[Test] Pass@k computation...")
+
+    from .eval_humaneval import pass_at_k, compute_pass_at_k_from_samples
+
+    # Test edge cases
+    assert pass_at_k(n=50, c=0, k=1) == 0.0, "0 correct should give 0"
+    assert pass_at_k(n=50, c=50, k=1) == 1.0, "All correct should give 1"
+    assert pass_at_k(n=10, c=5, k=1) == 0.5, "Half correct should give 0.5"
+
+    # Test with n < k
+    assert pass_at_k(n=3, c=2, k=5) == 0.0, "n < k should give 0"
+
+    # Test pass@1 from 50 samples: if 25 pass, pass@1 = 1 - C(25,1)/C(50,1) = 1 - 25/50 = 0.5
+    result = pass_at_k(n=50, c=25, k=1)
+    assert abs(result - 0.5) < 1e-10, f"Expected 0.5, got {result}"
+
+    # Test aggregation
+    task_results = {
+        "task_0": [True, False, True, False, True],  # 3/5 correct
+        "task_1": [False, False, False, False, False],  # 0/5 correct
+        "task_2": [True, True, True, True, True],  # 5/5 correct
+    }
+    metrics = compute_pass_at_k_from_samples(task_results, k=1)
+
+    assert metrics["num_tasks"] == 3, f"Expected 3 tasks, got {metrics['num_tasks']}"
+    assert metrics["tasks_with_any_pass"] == 2, f"Expected 2 tasks with pass, got {metrics['tasks_with_any_pass']}"
+
+    # Check per-task values
+    assert metrics["per_task"]["task_0"]["pass@1"] == 0.6  # 3/5
+    assert metrics["per_task"]["task_1"]["pass@1"] == 0.0  # 0/5
+    assert metrics["per_task"]["task_2"]["pass@1"] == 1.0  # 5/5
+
+    # Average should be (0.6 + 0.0 + 1.0) / 3 = 0.5333...
+    expected_avg = (0.6 + 0.0 + 1.0) / 3
+    assert abs(metrics["pass@1"] - expected_avg) < 1e-10, f"Expected {expected_avg}, got {metrics['pass@1']}"
+
+    print(f"   pass@k computations verified")
+    print("   PASSED")
+
+
 def run_smoke_test():
     """Run all smoke tests."""
     print("=" * 60)
@@ -196,6 +284,8 @@ def run_smoke_test():
         test_spectral_edit_smooth_abs()
         test_spectral_edit_gd()
         test_io_imports()
+        test_eval_profiles()
+        test_pass_at_k_computation()
 
         print()
         print("=" * 60)
