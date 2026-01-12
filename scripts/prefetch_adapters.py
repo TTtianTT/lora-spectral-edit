@@ -207,6 +207,82 @@ def build_humaneval_sweep_configs(
     return configs
 
 
+def build_calib_sweep_configs(
+    run_root: Path,
+    adapter_map: dict,
+    eval_max_samples: int,
+    calib_samples: list[int],
+    modes: list[str],
+    seeds: list[int],
+) -> list[dict]:
+    """
+    Build configs for calibration size ablation across multiple edit modes.
+    """
+    base_model = "meta-llama/Llama-2-7b-hf"
+    target_modules = ["down_proj", "o_proj"]
+
+    defaults = {
+        "target_modules": target_modules,
+        "core_frac": 0.2,
+        "noise_frac": 0.2,
+        "amp_factor": 1.25,
+        "sup_factor": 0.80,
+        "mid_factor": 1.0,
+        "smooth_temperature": 0.35,
+        "smooth_center_q": 0.5,
+        "smooth_align_mid": True,
+        "preserve_energy": "l1",
+        "calib_batch_size": 2,
+        "eval_fewshot": 5,
+        "eval_temperature": 0.0,
+        "eval_max_tokens": 512,
+        "eval_max_samples": int(eval_max_samples),
+        "keep_adapter": False,
+        "run_root": str(run_root),
+        "soft_temperature": None,
+        "soft_pivot_mode": None,
+        "z_high": 1.0,
+        "z_low": -0.5,
+        "z_tau": 0.2,
+        "z_fallback_std": 1e-6,
+    }
+
+    configs: list[dict] = []
+
+    def add_run(task: str, repo_id: str, edit_mode: str, seed: int, calib_n: int) -> None:
+        slug = repo_slug(repo_id)
+        out_dir = run_root / task / slug / f"calib_{calib_n}" / edit_mode / f"seed_{seed}"
+        eval_profile = "paper_math" if task.startswith("gsm8k") else "paper_code_main"
+        cfg = {
+            "task": task,
+            "base_model": base_model,
+            "lora_repo_id": repo_id,
+            "lora_local_path": adapter_map[repo_id],
+            "edit_mode": edit_mode,
+            "seed": int(seed),
+            "out_dir": str(out_dir),
+            "notes": "calib_sweep",
+            "eval_profile": eval_profile,
+            "calib_samples": int(calib_n),
+        }
+        cfg.update(defaults)
+        configs.append(cfg)
+
+    for repo_id in MATH_LORAS:
+        for calib_n in calib_samples:
+            for edit_mode in modes:
+                for seed in seeds:
+                    add_run("gsm8k_full", repo_id, edit_mode, seed, calib_n)
+
+    for repo_id in CODE_LORAS:
+        for calib_n in calib_samples:
+            for edit_mode in modes:
+                for seed in seeds:
+                    add_run("humaneval_full", repo_id, edit_mode, seed, calib_n)
+
+    return configs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Prefetch LoRA adapters into HF cache and write configs JSONL."
@@ -271,6 +347,25 @@ def main() -> None:
         default="42,43,44",
         help="Comma-separated seed values for sweep (e.g., '42,43,44').",
     )
+
+    # Calibration ablation sweep
+    parser.add_argument(
+        "--calib-sweep",
+        action="store_true",
+        help="Generate calibration-size ablation configs across modes.",
+    )
+    parser.add_argument(
+        "--calib-samples",
+        type=str,
+        default="32,64,128,256",
+        help="Comma-separated calib_samples values for ablation (e.g., '32,64,128,256').",
+    )
+    parser.add_argument(
+        "--modes",
+        type=str,
+        default="baseline,random_index,abs_select,z_score,double_smooth",
+        help="Comma-separated edit modes for calibration ablation.",
+    )
     args = parser.parse_args()
 
     root_dir = Path(__file__).resolve().parents[1]
@@ -299,7 +394,25 @@ def main() -> None:
     with mapping_path.open("w", encoding="utf-8") as f:
         json.dump(adapter_map, f, indent=2, ensure_ascii=False)
 
-    if args.sweep:
+    if args.calib_sweep:
+        calib_samples = parse_grid(args.calib_samples, int)
+        seeds = parse_grid(args.seeds, int)
+        modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+
+        configs = build_calib_sweep_configs(
+            run_root=run_root,
+            adapter_map=adapter_map,
+            eval_max_samples=args.eval_max_samples,
+            calib_samples=calib_samples,
+            modes=modes,
+            seeds=seeds,
+        )
+
+        print(
+            f"[CalibSweep] calib_samples={calib_samples} modes={modes} seeds={seeds} "
+            f"total={len(configs)}"
+        )
+    elif args.sweep:
         # Parse grid values
         amp_factors = parse_grid(args.amp_factors, float)
         sup_factors = parse_grid(args.sup_factors, float)

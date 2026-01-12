@@ -256,6 +256,7 @@ def main() -> None:
         row = {
             "task": task,
             "lora_repo_id": lora_repo_id,
+            "calib_samples": cfg.get("calib_samples"),
             "edit_mode": edit_mode,
             "seed": cfg.get("seed"),
             "out_dir": str(metrics_path.parent),
@@ -299,12 +300,17 @@ def main() -> None:
         results.extend(edited_results)
         print(f"[Collect] Parsed {len(edited_results)} edited results from {edited_dir}")
 
-    # Deduplicate baselines: keep one row per (task, lora_repo_id) for baseline
+    # Deduplicate baselines: keep one row per (task, lora_repo_id, calib_samples, seed)
     seen_baselines = set()
     deduped_results = []
     for row in results:
         if row.get("edit_mode") == "baseline":
-            key = (row.get("task"), row.get("lora_repo_id"))
+            key = (
+                row.get("task"),
+                row.get("lora_repo_id"),
+                row.get("calib_samples"),
+                row.get("seed"),
+            )
             if key in seen_baselines:
                 continue
             seen_baselines.add(key)
@@ -317,12 +323,13 @@ def main() -> None:
         for row in results:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    # Group by (task, lora_repo_id, edit_mode, amp_factor, sup_factor, soft_temperature, soft_pivot_mode)
+    # Group by (task, lora_repo_id, calib_samples, edit_mode, amp_factor, sup_factor, soft_temperature, soft_pivot_mode)
     groups = {}
     for row in results:
         key = (
             row.get("task"),
             row.get("lora_repo_id"),
+            row.get("calib_samples"),
             row.get("edit_mode"),
             row.get("amp_factor"),
             row.get("sup_factor"),
@@ -337,13 +344,23 @@ def main() -> None:
         groups[key]["seeds"].append(row.get("seed"))
 
     summary_rows = []
-    for (task, lora_repo_id, edit_mode, amp_f, sup_f, soft_t, pivot_m), data in sorted(groups.items()):
+    for (
+        task,
+        lora_repo_id,
+        calib_samples,
+        edit_mode,
+        amp_f,
+        sup_f,
+        soft_t,
+        pivot_m,
+    ), data in sorted(groups.items()):
         vals = data["values"]
         mean = statistics.mean(vals) if vals else 0.0
         std = statistics.pstdev(vals) if len(vals) > 1 else 0.0
         summary_rows.append({
             "task": task,
             "lora_repo_id": lora_repo_id,
+            "calib_samples": calib_samples,
             "edit_mode": edit_mode,
             "amp_factor": amp_f,
             "sup_factor": sup_f,
@@ -357,12 +374,12 @@ def main() -> None:
 
     # Markdown table
     md_lines = [
-        "| task | lora_repo_id | edit_mode | amp_factor | sup_factor | soft_temperature | soft_pivot_mode | metric | n | mean | std |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| task | lora_repo_id | calib_samples | edit_mode | amp_factor | sup_factor | soft_temperature | soft_pivot_mode | metric | n | mean | std |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in summary_rows:
         md_lines.append(
-            f"| {row['task']} | {row['lora_repo_id']} | {row['edit_mode']} | "
+            f"| {row['task']} | {row['lora_repo_id']} | {row['calib_samples']} | {row['edit_mode']} | "
             f"{row['amp_factor']} | {row['sup_factor']} | {row['soft_temperature']} | {row['soft_pivot_mode']} | "
             f"{row['metric_key']} | {row['n']} | {row['mean']:.6f} | {row['std']:.6f} |"
         )
@@ -373,10 +390,11 @@ def main() -> None:
     # CSV with all columns
     summary_csv = run_root / "summary.csv"
     with summary_csv.open("w", encoding="utf-8") as f:
-        f.write("task,lora_repo_id,edit_mode,seed,amp_factor,sup_factor,soft_temperature,soft_pivot_mode,pass@1\n")
+        f.write("task,lora_repo_id,calib_samples,edit_mode,seed,amp_factor,sup_factor,soft_temperature,soft_pivot_mode,pass@1\n")
         for row in results:
             task = row.get("task", "")
             lora_repo_id = row.get("lora_repo_id", "")
+            calib_samples = row.get("calib_samples", "")
             edit_mode = row.get("edit_mode", "")
             seed = row.get("seed", "")
             amp_f = row.get("amp_factor", "")
@@ -384,15 +402,16 @@ def main() -> None:
             soft_t = row.get("soft_temperature", "")
             pivot_m = row.get("soft_pivot_mode", "")
             pass_at_1 = row.get("pass@1", row.get("metric", ""))
-            f.write(f"{task},{lora_repo_id},{edit_mode},{seed},{amp_f},{sup_f},{soft_t},{pivot_m},{pass_at_1}\n")
+            f.write(f"{task},{lora_repo_id},{calib_samples},{edit_mode},{seed},{amp_f},{sup_f},{soft_t},{pivot_m},{pass_at_1}\n")
 
     # Also write TSV for convenience
     summary_tsv = run_root / "summary.tsv"
     with summary_tsv.open("w", encoding="utf-8") as f:
-        f.write("task\tlora_repo_id\tedit_mode\tseed\tamp_factor\tsup_factor\tsoft_temperature\tsoft_pivot_mode\tpass@1\n")
+        f.write("task\tlora_repo_id\tcalib_samples\tedit_mode\tseed\tamp_factor\tsup_factor\tsoft_temperature\tsoft_pivot_mode\tpass@1\n")
         for row in results:
             task = row.get("task", "")
             lora_repo_id = row.get("lora_repo_id", "")
+            calib_samples = row.get("calib_samples", "")
             edit_mode = row.get("edit_mode", "")
             seed = row.get("seed", "")
             amp_f = row.get("amp_factor", "")
@@ -400,7 +419,7 @@ def main() -> None:
             soft_t = row.get("soft_temperature", "")
             pivot_m = row.get("soft_pivot_mode", "")
             pass_at_1 = row.get("pass@1", row.get("metric", ""))
-            f.write(f"{task}\t{lora_repo_id}\t{edit_mode}\t{seed}\t{amp_f}\t{sup_f}\t{soft_t}\t{pivot_m}\t{pass_at_1}\n")
+            f.write(f"{task}\t{lora_repo_id}\t{calib_samples}\t{edit_mode}\t{seed}\t{amp_f}\t{sup_f}\t{soft_t}\t{pivot_m}\t{pass_at_1}\n")
 
     print(f"[Collect] Wrote: {results_path}")
     print(f"[Collect] Wrote: {summary_md}")

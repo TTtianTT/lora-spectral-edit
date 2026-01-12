@@ -12,7 +12,7 @@ import torch
 class EditConfig:
     """Configuration for spectral editing."""
     # Sensitivity mode: "abs_select" (recommended), "smooth_abs", "double_smooth",
-    # "z_score", "random_index", or "gd"
+    # "z_score", "robust_z", "random_index", or "gd"
     mode: str = "abs_select"
 
     # abs_select mode parameters
@@ -33,6 +33,12 @@ class EditConfig:
     z_low: float = -0.5
     z_tau: float = 0.2
     z_fallback_std: float = 1e-6
+
+    # robust_z mode parameters (median/MAD-based z-score)
+    robust_z_high: float = 1.0
+    robust_z_low: float = -0.5
+    robust_z_tau: float = 0.2
+    robust_fallback_sigma: float = 1e-6
 
     # gd mode parameters
     eta: float = 0.2            # Learning rate for gradient update
@@ -294,6 +300,84 @@ def apply_z_score_gate(
     return sigma_new, stats
 
 
+def apply_robust_z_gate(
+    sigma0: torch.Tensor,
+    g_abs: torch.Tensor,
+    config: EditConfig,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Robust z-score gating using median/MAD instead of mean/std.
+
+    Uses the Median Absolute Deviation (MAD) for a robust estimate of scale.
+    The robust z-score is: z_rob = (g_abs - median) / (MAD * 1.4826)
+    where 1.4826 is the consistency constant for normal distributions.
+    """
+    x = g_abs.to(dtype=torch.float32)
+    r = int(x.numel())
+
+    # Compute median and MAD
+    median = x.median()
+    mad = (x - median).abs().median()
+    # Scale MAD to estimate sigma (1.4826 for normal distribution)
+    sigma_robust = (mad * 1.4826).clamp_min(1e-8)
+
+    # Check for fallback condition
+    fallback = bool(float(sigma_robust.item()) < float(config.robust_fallback_sigma))
+
+    if fallback:
+        # Don't modify sigma if MAD is too small
+        gate = torch.ones_like(sigma0, dtype=sigma0.dtype)
+        sigma_new = sigma0.clone()
+        z_for_counts = torch.zeros_like(x)
+    else:
+        # Compute robust z-score
+        z_rob = (x - median) / sigma_robust
+
+        mid = float(config.mid_factor)
+        amp = float(config.amp_factor)
+        sup = float(config.sup_factor)
+        tau = max(1e-8, float(config.robust_z_tau))
+        z_high = float(config.robust_z_high)
+        z_low = float(config.robust_z_low)
+
+        delta_amp = amp - mid
+        delta_sup = mid - sup
+
+        # Double sigmoid gate in robust z-space
+        gate_amp = torch.sigmoid((z_rob - z_high) / tau)
+        gate_sup = torch.sigmoid((z_low - z_rob) / tau)
+        gate = mid + delta_amp * gate_amp - delta_sup * gate_sup
+        gate = gate.to(dtype=sigma0.dtype)
+
+        sigma_new = sigma0 * gate
+        z_for_counts = z_rob
+
+    # Compute effective counts
+    k_core_eff = int((z_for_counts > float(config.robust_z_high)).sum().item()) if r > 0 else 0
+    k_noise_eff = int((z_for_counts < float(config.robust_z_low)).sum().item()) if r > 0 else 0
+    frac_core = float(k_core_eff) / r if r > 0 else 0.0
+    frac_noise = float(k_noise_eff) / r if r > 0 else 0.0
+
+    stats: Dict[str, Any] = {
+        "r": r,
+        "mode": "robust_z",
+        "median": float(median.item()),
+        "mad": float(mad.item()),
+        "sigma_robust": float(sigma_robust.item()),
+        "z_high": float(config.robust_z_high),
+        "z_low": float(config.robust_z_low),
+        "tau": float(config.robust_z_tau),
+        "k_core_eff": k_core_eff,
+        "k_noise_eff": k_noise_eff,
+        "frac_core": frac_core,
+        "frac_noise": frac_noise,
+        "fallback": fallback,
+        "gate_min": float(gate.min().item()),
+        "gate_max": float(gate.max().item()),
+    }
+    return sigma_new, stats
+
+
 def apply_random_index(
     sigma0: torch.Tensor,
     config: EditConfig,
@@ -425,6 +509,11 @@ def apply_spectral_edit(
     elif config.mode == "z_score":
         sigma_new, z_stats = apply_z_score_gate(sigma0, g_abs_norm, config)
         stats.update(z_stats)
+        stats["k_core"] = None
+        stats["k_noise"] = None
+    elif config.mode == "robust_z":
+        sigma_new, robust_stats = apply_robust_z_gate(sigma0, g_abs_norm, config)
+        stats.update(robust_stats)
         stats["k_core"] = None
         stats["k_noise"] = None
     elif config.mode == "random_index":

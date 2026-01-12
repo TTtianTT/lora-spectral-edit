@@ -55,6 +55,12 @@ emit("Z_LOW", cfg.get("z_low", -0.5))
 emit("Z_TAU", cfg.get("z_tau", 0.2))
 emit("Z_FALLBACK_STD", cfg.get("z_fallback_std", 1e-6))
 
+# robust_z parameters
+emit("ROBUST_Z_HIGH", cfg.get("robust_z_high", 1.0))
+emit("ROBUST_Z_LOW", cfg.get("robust_z_low", -0.5))
+emit("ROBUST_Z_TAU", cfg.get("robust_z_tau", 0.2))
+emit("ROBUST_FALLBACK_SIGMA", cfg.get("robust_fallback_sigma", 1e-6))
+
 # Spectral gate sweep parameters
 emit("SOFT_TEMPERATURE", cfg.get("soft_temperature", ""))
 emit("SOFT_PIVOT_MODE", cfg.get("soft_pivot_mode", ""))
@@ -150,6 +156,10 @@ trap cleanup EXIT
       --z_low "${Z_LOW}" \
       --z_tau "${Z_TAU}" \
       --z_fallback_std "${Z_FALLBACK_STD}" \
+      --robust_z_high "${ROBUST_Z_HIGH}" \
+      --robust_z_low "${ROBUST_Z_LOW}" \
+      --robust_z_tau "${ROBUST_Z_TAU}" \
+      --robust_fallback_sigma "${ROBUST_FALLBACK_SIGMA}" \
       "${EDIT_ARGS[@]}" \
       --preserve_energy "${PRESERVE_ENERGY}" \
       --calib_samples "${CALIB_SAMPLES}" \

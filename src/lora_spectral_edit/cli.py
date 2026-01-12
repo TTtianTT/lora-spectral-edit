@@ -245,6 +245,10 @@ def run_edit(args):
         z_low=args.z_low,
         z_tau=args.z_tau,
         z_fallback_std=args.z_fallback_std,
+        robust_z_high=args.robust_z_high,
+        robust_z_low=args.robust_z_low,
+        robust_z_tau=args.robust_z_tau,
+        robust_fallback_sigma=args.robust_fallback_sigma,
         eta=args.eta,
         update_mode=args.update_mode,
         asymmetric_update=args.asymmetric_update,
@@ -759,9 +763,9 @@ def main():
 
     edit_parser.add_argument("--mode", "--edit_mode", type=str,
                              choices=["abs_select", "smooth_abs", "double_smooth", "z_score",
-                                      "random_index", "gd"],
+                                      "robust_z", "random_index", "gd"],
                              default="abs_select",
-                             help="Edit mode: abs_select, smooth_abs, double_smooth, z_score, random_index, or gd")
+                             help="Edit mode: abs_select, smooth_abs, double_smooth, z_score, robust_z, random_index, or gd")
     edit_parser.add_argument("--core_frac", type=float, default=0.2,
                              help="Fraction of dims to amplify (abs_select mode)")
     edit_parser.add_argument("--noise_frac", type=float, default=0.2,
@@ -790,6 +794,15 @@ def main():
                              help="Temperature for z-score gating (z_score mode)")
     edit_parser.add_argument("--z_fallback_std", type=float, default=1e-6,
                              help="Stddev floor that triggers z_score fallback")
+
+    edit_parser.add_argument("--robust_z_high", type=float, default=1.0,
+                             help="Robust z-score threshold for amplification (robust_z mode)")
+    edit_parser.add_argument("--robust_z_low", type=float, default=-0.5,
+                             help="Robust z-score threshold for suppression (robust_z mode)")
+    edit_parser.add_argument("--robust_z_tau", type=float, default=0.2,
+                             help="Temperature for robust z-score gating (robust_z mode)")
+    edit_parser.add_argument("--robust_fallback_sigma", type=float, default=1e-6,
+                             help="Sigma floor that triggers robust_z fallback")
 
     edit_parser.add_argument("--eta", type=float, default=0.2,
                              help="Learning rate (gd mode)")
