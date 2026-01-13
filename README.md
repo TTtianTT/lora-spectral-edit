@@ -13,6 +13,10 @@ LoRA Spectral Edit performs the following:
    - **Noise features** (low |g|): Suppress
 4. **Reconstruction**: Rebuilds LoRA matrices from edited singular values
 
+## Docs / Core Idea
+
+- [Core idea of LoRA spectral editing](docs/core_idea_lora_spectral_edit.md)
+
 ## Installation
 
 ### Basic (editing only)
