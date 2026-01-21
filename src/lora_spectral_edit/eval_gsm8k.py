@@ -1,17 +1,21 @@
+from __future__ import annotations
+
 """
-GSM8K evaluation utilities using vLLM.
+GSM8K strict-match evaluation (vLLM-first), aligned with the updated evaluation style.
 
-This module is optional and requires vLLM to be installed.
-
-Supports evaluation profiles matching "LoRA Learns Less and Forgets Less" paper:
-- paper_math: 5-shot, greedy decoding, strict match accuracy (1319 test samples)
+Key alignment with the updated script:
+- Prompt template: instruction + "#### <answer>" requirement
+- Answer extraction: _extract_answer + _norm, strict string match
+- Outputs: predictions.jsonl + metrics.json (and optional eval_config.json if you still want)
+- Supports: split / max_samples / max_new_tokens / dtype / tensor_parallel_size / (optional) few-shot
 """
 
 import os
 import re
 import json
+from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 from datasets import load_dataset
 
@@ -26,6 +30,10 @@ except ImportError:
     HAVE_VLLM = False
 
 
+# ----------------------------
+# small helpers (keep yours)
+# ----------------------------
+
 def _env_truthy(name: str) -> bool | None:
     val = os.environ.get(name)
     if val is None:
@@ -33,8 +41,7 @@ def _env_truthy(name: str) -> bool | None:
     return val.strip().lower() in {"1", "true", "yes", "y"}
 
 
-def check_vllm_available():
-    """Check if vLLM is available and raise if not."""
+def check_vllm_available() -> None:
     if not HAVE_VLLM:
         raise RuntimeError(
             "vLLM not available. Please install it with: pip install vllm\n"
@@ -42,433 +49,376 @@ def check_vllm_available():
         )
 
 
-def extract_gsm8k_final_number(ans: str) -> Optional[str]:
+def _extract_answer(text: str) -> str:
     """
-    Extract the final answer number from GSM8K format.
-
-    GSM8K answers end with '#### <number>'. Falls back to last integer if not found.
-    This implements strict-match parsing as per the paper.
+    Updated strict-match extraction:
+    - If "####" exists: take the first line after the last ####
+    - Else: fall back to the last number-like token
+    - Else: fall back to last non-empty line
     """
-    # Primary: look for #### format (official GSM8K format)
-    m = re.findall(r"####\s*(-?\d[\d,]*)", ans)
-    if m:
-        # Remove commas from number
-        return m[-1].replace(",", "")
-    # Fallback: last number in text
-    m2 = re.findall(r"(-?\d[\d,]*)", ans.replace(",", ""))
-    return m2[-1] if m2 else None
+    if "####" in text:
+        tail = text.split("####")[-1].strip()
+        return tail.splitlines()[0].strip() if tail else ""
+    matches = re.findall(r"-?\d[\d,]*\.?\d*", text)
+    if matches:
+        return matches[-1].strip()
+    text = text.strip()
+    return text.splitlines()[-1].strip() if text else ""
 
 
-def pred_number(text: str) -> Optional[str]:
-    """Extract predicted number from model output using strict-match parsing."""
-    # Primary: look for #### format
-    m = re.findall(r"####\s*(-?\d[\d,]*)", text)
-    if m:
-        return m[-1].replace(",", "")
-    # Fallback: last number in text
-    m2 = re.findall(r"(-?\d[\d,]*)", text.replace(",", ""))
-    return m2[-1].replace(",", "") if m2 else None
+def _norm(s: str) -> str:
+    return s.strip().replace(",", "")
 
 
-def build_gsm8k_fewshot_prefix(train_ds, k: int) -> str:
-    """Build few-shot prompt prefix from training examples."""
-    k = max(0, int(k))
-    if k == 0:
-        return ""
-    examples = train_ds.select(range(k))
-    parts = []
-    for ex in examples:
-        parts.append(f"Question: {ex['question']}\nAnswer: {ex['answer']}\n")
-    return "\n".join(parts) + "\n"
-
-
-def write_eval_config(
-    out_dir: str,
-    task: str,
-    split: str,
-    num_fewshot: int,
-    temperature: float,
-    top_p: float,
-    max_tokens: int,
-    total_samples: int,
-    metric: str,
-    score: float,
-    correct: int,
-    extra_meta: Optional[Dict[str, Any]] = None,
-) -> str:
+def _dtype_to_vllm(dtype: str) -> str:
     """
-    Write evaluation config summary to a JSON file in the run directory.
-
-    Args:
-        out_dir: Output directory
-        task: Task name (e.g., "gsm8k")
-        split: Dataset split (e.g., "test")
-        num_fewshot: Number of few-shot examples
-        temperature: Sampling temperature
-        top_p: Top-p sampling parameter
-        max_tokens: Max tokens to generate
-        total_samples: Total number of samples evaluated
-        metric: Metric name (e.g., "strict_match_accuracy")
-        score: Metric score
-        correct: Number of correct predictions
-        extra_meta: Additional metadata to include
-
-    Returns:
-        Path to the written config file
+    Map your CLI-like dtype choices to vLLM dtype strings.
+    vLLM commonly accepts: "auto", "float16", "bfloat16", "float32".
     """
-    config = {
-        "task": task,
-        "split": split,
-        "num_fewshot": num_fewshot,
-        "decoding": {
-            "temperature": temperature,
-            "top_p": top_p,
-            "max_tokens": max_tokens,
-            "strategy": "greedy" if temperature == 0.0 else "sampling",
-        },
-        "total_samples": total_samples,
-        "metric": {
-            "name": metric,
-            "score": score,
-            "correct": correct,
-            "total": total_samples,
-        },
-        "timestamp": datetime.now().isoformat(),
-    }
-
-    if extra_meta:
-        config["meta"] = extra_meta
-
-    os.makedirs(out_dir, exist_ok=True)
-    config_path = os.path.join(out_dir, "eval_config.json")
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-
-    return config_path
+    d = (dtype or "auto").lower()
+    if d in {"auto"}:
+        return "auto"
+    if d in {"bf16", "bfloat16"}:
+        return "bfloat16"
+    if d in {"fp16", "float16"}:
+        return "float16"
+    if d in {"fp32", "float32"}:
+        return "float32"
+    raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-def evaluate_gsm8k_vllm(
-    base_model_id: str,
-    lora_dir: str,
-    fewshot_k: int = 5,
-    max_samples: int = -1,
-    temperature: float = 0.0,
-    top_p: float = 1.0,
-    max_tokens: int = 512,
-    seed: int = 0,
-    max_model_len: int = 4096,
-    out_dir: Optional[str] = None,
-    write_config: bool = True,
-) -> dict:
-    """
-    Evaluate a LoRA adapter on GSM8K using vLLM.
-
-    Args:
-        base_model_id: HuggingFace model ID for the base model.
-        lora_dir: Path to the LoRA adapter directory.
-        fewshot_k: Number of few-shot examples (paper_math: 5).
-        max_samples: Maximum number of test samples (-1 for all 1319).
-        temperature: Sampling temperature (0 for greedy, paper_math: 0.0).
-        top_p: Top-p sampling (paper_math: 1.0).
-        max_tokens: Maximum tokens to generate.
-        seed: Random seed.
-        max_model_len: Maximum model context length.
-        out_dir: Output directory for config JSON (defaults to lora_dir).
-        write_config: Whether to write eval config JSON.
-
-    Returns:
-        Dictionary with 'acc', 'correct', 'total', and optionally 'config_path'.
-    """
-    check_vllm_available()
-
-    ds = load_dataset("gsm8k", "main")
-    train_ds, test_ds = ds["train"], ds["test"]
-
-    fewshot_prefix = build_gsm8k_fewshot_prefix(train_ds, fewshot_k)
-
-    # Determine max_lora_rank from adapter_config
-    cfg = load_adapter_config(lora_dir)
+def _get_lora_max_rank(adapter_dir: str) -> int:
+    cfg = load_adapter_config(adapter_dir)
     r = int(cfg.get("r", 0) or 0)
     if r <= 0 and isinstance(cfg.get("rank_pattern", None), dict):
         r = max(int(v) for v in cfg["rank_pattern"].values())
     if r <= 0:
-        raise ValueError("Cannot determine LoRA rank r from adapter_config.json")
-
-    gpu_mem_util = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", None)
-    gpu_mem_util = float(gpu_mem_util) if gpu_mem_util is not None else None
-
-    enforce_eager = _env_truthy("VLLM_ENFORCE_EAGER")
-    llm_kwargs = {
-        "model": base_model_id,
-        "dtype": "float16",
-        "max_model_len": max_model_len,
-        "enable_lora": True,
-        "max_lora_rank": r,
-        "seed": seed,
-    }
-    if gpu_mem_util is not None:
-        llm_kwargs["gpu_memory_utilization"] = gpu_mem_util
-    if enforce_eager is not None:
-        llm_kwargs["enforce_eager"] = enforce_eager
-    llm = LLM(**llm_kwargs)
-    sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
-
-    if max_samples is None or int(max_samples) < 0:
-        eval_ds = test_ds
-    else:
-        eval_ds = test_ds.select(range(int(max_samples)))
-
-    lora_req = LoRARequest("adapter", 1, lora_dir)
-
-    prompts = []
-    gold_nums = []
-    for ex in eval_ds:
-        q = ex["question"]
-        gold = extract_gsm8k_final_number(ex["answer"])
-        gold_nums.append(gold)
-        prompts.append(fewshot_prefix + f"Question: {q}\nAnswer:")
-
-    outputs = llm.generate(prompts, sp, lora_request=lora_req)
-
-    correct = 0
-    total = len(gold_nums)
-    predictions = []
-    for out, gold in zip(outputs, gold_nums):
-        gen = out.outputs[0].text
-        pred = pred_number(gen)
-        predictions.append({
-            "gold": gold,
-            "pred": pred,
-            "correct": gold is not None and pred == gold,
-            "generation": gen,
-        })
-        if gold is not None and pred == gold:
-            correct += 1
-
-    acc = correct / total if total else 0.0
-    result = {"acc": acc, "correct": correct, "total": total}
-
-    # Write config JSON if requested
-    if write_config:
-        config_dir = out_dir if out_dir else lora_dir
-        config_path = write_eval_config(
-            out_dir=config_dir,
-            task="gsm8k",
-            split="test",
-            num_fewshot=fewshot_k,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            total_samples=total,
-            metric="strict_match_accuracy",
-            score=acc,
-            correct=correct,
-            extra_meta={
-                "base_model_id": base_model_id,
-                "lora_dir": lora_dir,
-                "seed": seed,
-                "max_model_len": max_model_len,
-            },
-        )
-        result["config_path"] = config_path
-
-        # Also write predictions for auditability
-        preds_path = os.path.join(config_dir, "gsm8k_predictions.jsonl")
-        with open(preds_path, "w", encoding="utf-8") as f:
-            for i, p in enumerate(predictions):
-                f.write(json.dumps({"idx": i, **p}, ensure_ascii=False) + "\n")
-        result["predictions_path"] = preds_path
-
-    return result
+        raise ValueError(f"Cannot determine LoRA rank r from adapter_config.json in {adapter_dir}")
+    return r
 
 
-def evaluate_gsm8k_with_profile(
-    base_model_id: str,
-    lora_dir: str,
-    profile_name: str = "paper_math",
+# ----------------------------
+# prompt building (updated)
+# ----------------------------
+
+_INSTRUCTION_HEADER = (
+    "Solve the following problem. Put your final numeric answer on the last line as:\n"
+    "#### <answer>\n\n"
+)
+
+def build_gsm8k_prompt(question: str) -> str:
+    q = str(question).strip()
+    return _INSTRUCTION_HEADER + f"Problem:\n{q}\n\nAnswer:\n"
+
+
+def build_gsm8k_fewshot_prefix(train_ds, k: int) -> str:
+    """
+    Few-shot examples in the SAME prompt style (optional).
+    If you want to match the paper setting: k=5, and answers from GSM8K train include '#### ...'.
+    """
+    k = max(0, int(k))
+    if k == 0:
+        return ""
+    examples = train_ds.select(range(k))
+    parts: List[str] = []
+    # Put instruction header once at the top, then examples as (Problem/Answer) blocks.
+    parts.append(_INSTRUCTION_HEADER)
+    for ex in examples:
+        q = str(ex.get("question", "")).strip()
+        a = str(ex.get("answer", "")).strip()
+        parts.append(f"Problem:\n{q}\n\nAnswer:\n{a}\n")
+    return "\n".join(parts).rstrip() + "\n\n"
+
+
+# ----------------------------
+# file outputs (updated)
+# ----------------------------
+
+def _save_json(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+# ----------------------------
+# main eval (vLLM)
+# ----------------------------
+
+def evaluate_gsm8k_vllm(
+    base_model: str,
+    adapter_dir: Optional[str],
+    output_dir: str,
+    split: str = "test",
     max_samples: Optional[int] = None,
-    seed: int = 0,
+    max_new_tokens: int = 256,
+    dtype: str = "auto",               # auto/bf16/fp16/fp32
+    seed: int = 42,
+    tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
-    out_dir: Optional[str] = None,
-) -> dict:
+    fewshot_k: int = 0,                # set to 5 if you still want paper-style 5-shot
+    write_eval_config_json: bool = False,  # keep off by default to match your updated script
+) -> Dict[str, Any]:
     """
-    Evaluate GSM8K using a predefined profile.
+    vLLM strict-match accuracy on GSM8K (aligned with updated script outputs).
 
-    Args:
-        base_model_id: HuggingFace model ID for the base model.
-        lora_dir: Path to the LoRA adapter directory.
-        profile_name: Profile name ("paper_math" for paper settings).
-        max_samples: Override max samples (None uses profile default).
-        seed: Random seed.
-        max_model_len: Maximum model context length.
-        out_dir: Output directory for results.
-
-    Returns:
-        Dictionary with evaluation results and config.
-    """
-    from .eval_profiles import get_profile
-
-    profile = get_profile(profile_name)
-
-    if profile.task != "gsm8k":
-        raise ValueError(f"Profile '{profile_name}' is for task '{profile.task}', not gsm8k")
-
-    samples = max_samples if max_samples is not None else profile.max_samples
-
-    result = evaluate_gsm8k_vllm(
-        base_model_id=base_model_id,
-        lora_dir=lora_dir,
-        fewshot_k=profile.num_fewshot,
-        max_samples=samples,
-        temperature=profile.temperature,
-        top_p=profile.top_p,
-        max_tokens=profile.max_tokens,
-        seed=seed,
-        max_model_len=max_model_len,
-        out_dir=out_dir,
-        write_config=True,
-    )
-
-    result["profile"] = profile.get_summary()
-    return result
-
-
-def evaluate_both_loras(
-    base_model_id: str,
-    baseline_lora_dir: str,
-    edited_lora_dir: str,
-    fewshot_k: int = 5,
-    max_samples: int = -1,
-    temperature: float = 0.0,
-    top_p: float = 1.0,
-    max_tokens: int = 512,
-    seed: int = 0,
-    max_model_len: int = 4096,
-    out_dir: Optional[str] = None,
-    write_config: bool = True,
-) -> dict:
-    """
-    Evaluate both baseline and edited LoRA adapters on GSM8K.
-
-    Uses a single vLLM engine for efficiency.
-
-    Returns:
-        Dictionary with 'baseline' and 'edited' result dicts.
+    Writes:
+      - predictions.jsonl
+      - metrics.json
+      - (optional) eval_config.json
     """
     check_vllm_available()
 
-    ds = load_dataset("gsm8k", "main")
-    train_ds, test_ds = ds["train"], ds["test"]
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    preds_path = out_dir / "predictions.jsonl"
+    metrics_path = out_dir / "metrics.json"
 
-    fewshot_prefix = build_gsm8k_fewshot_prefix(train_ds, fewshot_k)
+    # dataset
+    try:
+        ds = load_dataset("gsm8k", "main", split=split)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load gsm8k split={split}: {exc}") from exc
 
-    # Determine max rank from both adapters
-    cfg_base = load_adapter_config(baseline_lora_dir)
-    cfg_edit = load_adapter_config(edited_lora_dir)
+    if max_samples is not None:
+        ds = ds.select(range(min(int(max_samples), len(ds))))
 
-    def get_rank(cfg):
-        r = int(cfg.get("r", 0) or 0)
-        if r <= 0 and isinstance(cfg.get("rank_pattern", None), dict):
-            r = max(int(v) for v in cfg["rank_pattern"].values())
-        return r
+    # few-shot (optional)
+    fewshot_prefix = ""
+    if int(fewshot_k) > 0:
+        train_ds = load_dataset("gsm8k", "main", split="train")
+        fewshot_prefix = build_gsm8k_fewshot_prefix(train_ds, fewshot_k)
 
-    max_r = max(get_rank(cfg_base), get_rank(cfg_edit))
-    if max_r <= 0:
-        raise ValueError("Cannot determine LoRA rank from adapter configs")
+    # vLLM engine
+    gpu_mem_util = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", None)
+    gpu_mem_util = float(gpu_mem_util) if gpu_mem_util is not None else None
+    enforce_eager = _env_truthy("VLLM_ENFORCE_EAGER")
+
+    llm_kwargs: Dict[str, Any] = {
+        "model": base_model,
+        "dtype": _dtype_to_vllm(dtype),
+        "max_model_len": int(max_model_len),
+        "seed": int(seed),
+        "tensor_parallel_size": int(tensor_parallel_size),
+    }
+
+    use_lora = adapter_dir is not None and str(adapter_dir).strip() != ""
+    if use_lora:
+        max_r = _get_lora_max_rank(str(adapter_dir))
+        llm_kwargs["enable_lora"] = True
+        llm_kwargs["max_lora_rank"] = int(max_r)
+
+    if gpu_mem_util is not None:
+        llm_kwargs["gpu_memory_utilization"] = gpu_mem_util
+    if enforce_eager is not None:
+        llm_kwargs["enforce_eager"] = enforce_eager
+
+    llm = LLM(**llm_kwargs)
+    sp = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=int(max_new_tokens))
+
+    prompts: List[str] = []
+    records: List[Tuple[str, str]] = []
+    for ex in ds:
+        q = str(ex.get("question", "")).strip()
+        gold_raw = str(ex.get("answer", "")).strip()
+        gold = _norm(_extract_answer(gold_raw))
+        prompt = (fewshot_prefix + f"Problem:\n{q}\n\nAnswer:\n") if fewshot_prefix else build_gsm8k_prompt(q)
+        prompts.append(prompt)
+        records.append((q, gold))
+
+    # generate
+    if use_lora:
+        lora_req = LoRARequest("adapter", 1, str(adapter_dir))
+        outputs = llm.generate(prompts, sp, lora_request=lora_req)
+    else:
+        outputs = llm.generate(prompts, sp)
+
+    correct = 0
+    total = 0
+    with preds_path.open("w", encoding="utf-8") as f:
+        for (q, gold), out in zip(records, outputs):
+            gen = out.outputs[0].text
+            pred = _norm(_extract_answer(gen))
+            is_correct = int(pred == gold)
+            correct += is_correct
+            total += 1
+
+            rec: Dict[str, Any] = {
+                "question": q,
+                "gold": gold,
+                "prediction_text": gen,
+                "prediction_extracted": pred,
+                "correct": bool(is_correct),
+            }
+            if use_lora:
+                rec["adapter_dir"] = str(adapter_dir)
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    metrics = {
+        "accuracy_strict": (correct / total if total else 0.0),
+        "correct": correct,
+        "total": total,
+    }
+    _save_json(metrics_path, metrics)
+
+    if write_eval_config_json:
+        eval_config = {
+            "task": "gsm8k",
+            "split": split,
+            "max_samples": max_samples,
+            "max_new_tokens": max_new_tokens,
+            "dtype": dtype,
+            "seed": seed,
+            "tensor_parallel_size": tensor_parallel_size,
+            "max_model_len": max_model_len,
+            "fewshot_k": fewshot_k,
+            "base_model": base_model,
+            "adapter_dir": str(adapter_dir) if use_lora else None,
+            "timestamp": datetime.now().isoformat(),
+            "outputs": {
+                "predictions": str(preds_path),
+                "metrics": str(metrics_path),
+            },
+        }
+        _save_json(out_dir / "eval_config.json", eval_config)
+
+    return {
+        **metrics,
+        "predictions_path": str(preds_path),
+        "metrics_path": str(metrics_path),
+    }
+
+
+def evaluate_both_loras_vllm(
+    base_model: str,
+    baseline_adapter_dir: str,
+    edited_adapter_dir: str,
+    output_dir: str,
+    split: str = "test",
+    max_samples: Optional[int] = None,
+    max_new_tokens: int = 256,
+    dtype: str = "auto",
+    seed: int = 42,
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 4096,
+    fewshot_k: int = 0,
+) -> Dict[str, Any]:
+    """
+    Evaluate baseline + edited adapters with a single vLLM engine.
+    Writes:
+      - predictions_baseline.jsonl
+      - predictions_edited.jsonl
+      - metrics.json  (includes both)
+    """
+    check_vllm_available()
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    preds_base_path = out_dir / "predictions_baseline.jsonl"
+    preds_edit_path = out_dir / "predictions_edited.jsonl"
+    metrics_path = out_dir / "metrics.json"
+
+    # dataset
+    try:
+        ds = load_dataset("gsm8k", "main", split=split)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load gsm8k split={split}: {exc}") from exc
+    if max_samples is not None:
+        ds = ds.select(range(min(int(max_samples), len(ds))))
+
+    # few-shot (optional)
+    fewshot_prefix = ""
+    if int(fewshot_k) > 0:
+        train_ds = load_dataset("gsm8k", "main", split="train")
+        fewshot_prefix = build_gsm8k_fewshot_prefix(train_ds, fewshot_k)
+
+    prompts: List[str] = []
+    records: List[Tuple[str, str]] = []
+    for ex in ds:
+        q = str(ex.get("question", "")).strip()
+        gold_raw = str(ex.get("answer", "")).strip()
+        gold = _norm(_extract_answer(gold_raw))
+        prompt = (fewshot_prefix + f"Problem:\n{q}\n\nAnswer:\n") if fewshot_prefix else build_gsm8k_prompt(q)
+        prompts.append(prompt)
+        records.append((q, gold))
+
+    # engine rank = max(baseline, edited)
+    max_r = max(_get_lora_max_rank(baseline_adapter_dir), _get_lora_max_rank(edited_adapter_dir))
 
     gpu_mem_util = os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", None)
     gpu_mem_util = float(gpu_mem_util) if gpu_mem_util is not None else None
-
     enforce_eager = _env_truthy("VLLM_ENFORCE_EAGER")
-    llm_kwargs = {
-        "model": base_model_id,
-        "dtype": "float16",
-        "max_model_len": max_model_len,
+
+    llm_kwargs: Dict[str, Any] = {
+        "model": base_model,
+        "dtype": _dtype_to_vllm(dtype),
+        "max_model_len": int(max_model_len),
+        "seed": int(seed),
+        "tensor_parallel_size": int(tensor_parallel_size),
         "enable_lora": True,
-        "max_lora_rank": max_r,
-        "seed": seed,
+        "max_lora_rank": int(max_r),
     }
     if gpu_mem_util is not None:
         llm_kwargs["gpu_memory_utilization"] = gpu_mem_util
     if enforce_eager is not None:
         llm_kwargs["enforce_eager"] = enforce_eager
+
     llm = LLM(**llm_kwargs)
-    sp = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+    sp = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=int(max_new_tokens))
 
-    if max_samples is None or int(max_samples) < 0:
-        eval_ds = test_ds
-    else:
-        eval_ds = test_ds.select(range(int(max_samples)))
-
-    prompts = []
-    gold_nums = []
-    for ex in eval_ds:
-        q = ex["question"]
-        gold = extract_gsm8k_final_number(ex["answer"])
-        gold_nums.append(gold)
-        prompts.append(fewshot_prefix + f"Question: {q}\nAnswer:")
-
-    total = len(gold_nums)
-    results = {}
-
-    for name, lora_dir in [("baseline", baseline_lora_dir), ("edited", edited_lora_dir)]:
-        lora_req = LoRARequest(name, 1 if name == "baseline" else 2, lora_dir)
+    def _run_one(name: str, adapter_dir: str, req_id: int, preds_path: Path) -> Dict[str, Any]:
+        lora_req = LoRARequest(name, req_id, adapter_dir)
         outputs = llm.generate(prompts, sp, lora_request=lora_req)
 
         correct = 0
-        predictions = []
-        for out, gold in zip(outputs, gold_nums):
-            gen = out.outputs[0].text
-            pred = pred_number(gen)
-            is_correct = gold is not None and pred == gold
-            predictions.append({
-                "gold": gold,
-                "pred": pred,
-                "correct": is_correct,
-                "generation": gen,
-            })
-            if is_correct:
-                correct += 1
+        total = 0
+        with preds_path.open("w", encoding="utf-8") as f:
+            for (q, gold), out in zip(records, outputs):
+                gen = out.outputs[0].text
+                pred = _norm(_extract_answer(gen))
+                is_correct = int(pred == gold)
+                correct += is_correct
+                total += 1
+                f.write(json.dumps({
+                    "question": q,
+                    "gold": gold,
+                    "prediction_text": gen,
+                    "prediction_extracted": pred,
+                    "correct": bool(is_correct),
+                    "adapter_dir": adapter_dir,
+                }, ensure_ascii=False) + "\n")
 
-        acc = correct / total if total else 0.0
-        results[name] = {"acc": acc, "correct": correct, "total": total}
-
-        # Write predictions if out_dir specified
-        if write_config and out_dir:
-            preds_path = os.path.join(out_dir, f"gsm8k_predictions_{name}.jsonl")
-            os.makedirs(out_dir, exist_ok=True)
-            with open(preds_path, "w", encoding="utf-8") as f:
-                for i, p in enumerate(predictions):
-                    f.write(json.dumps({"idx": i, **p}, ensure_ascii=False) + "\n")
-            results[name]["predictions_path"] = preds_path
-
-    # Write combined config
-    if write_config and out_dir:
-        config = {
-            "task": "gsm8k",
-            "split": "test",
-            "num_fewshot": fewshot_k,
-            "decoding": {
-                "temperature": temperature,
-                "top_p": top_p,
-                "max_tokens": max_tokens,
-                "strategy": "greedy" if temperature == 0.0 else "sampling",
-            },
-            "total_samples": total,
-            "baseline": results["baseline"],
-            "edited": results["edited"],
-            "meta": {
-                "base_model_id": base_model_id,
-                "baseline_lora_dir": baseline_lora_dir,
-                "edited_lora_dir": edited_lora_dir,
-                "seed": seed,
-                "max_model_len": max_model_len,
-            },
-            "timestamp": datetime.now().isoformat(),
+        return {
+            "accuracy_strict": (correct / total if total else 0.0),
+            "correct": correct,
+            "total": total,
+            "predictions_path": str(preds_path),
         }
-        config_path = os.path.join(out_dir, "eval_config.json")
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        results["config_path"] = config_path
 
-    return results
+    baseline_metrics = _run_one("baseline", baseline_adapter_dir, 1, preds_base_path)
+    edited_metrics = _run_one("edited", edited_adapter_dir, 2, preds_edit_path)
+
+    metrics = {
+        "baseline": baseline_metrics,
+        "edited": edited_metrics,
+        "meta": {
+            "task": "gsm8k",
+            "split": split,
+            "max_samples": max_samples,
+            "max_new_tokens": max_new_tokens,
+            "dtype": dtype,
+            "seed": seed,
+            "tensor_parallel_size": tensor_parallel_size,
+            "max_model_len": max_model_len,
+            "fewshot_k": fewshot_k,
+            "base_model": base_model,
+            "baseline_adapter_dir": baseline_adapter_dir,
+            "edited_adapter_dir": edited_adapter_dir,
+            "timestamp": datetime.now().isoformat(),
+        },
+    }
+    _save_json(metrics_path, metrics)
+
+    return {
+        "baseline": baseline_metrics,
+        "edited": edited_metrics,
+        "metrics_path": str(metrics_path),
+    }
